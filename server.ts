@@ -48,8 +48,15 @@ try {
   // Ignore on runtimes that do not support setDefaultResultOrder
 }
 
-const AI_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const AI_REQUEST_TIMEOUT_MS = 35_000;
+const GEMINI_REST_BASE =
+  'https://generativelanguage.googleapis.com/v1beta/models';
+const DEFAULT_GEMINI_MODEL = 'gemini-1.5-flash';
+const GEMINI_FALLBACK_MODELS = [
+  'gemini-1.5-flash',
+  'gemini-2.0-flash',
+  'gemini-2.5-flash',
+] as const;
 const IMAGEN_FALLBACK_MODELS = [
   IMAGEN_MODEL_ID,
   'imagen-3.0-generate-002',
@@ -129,8 +136,11 @@ class UpstreamTimeoutError extends Error {
   readonly status = 504;
   readonly code = 'UPSTREAM_TIMEOUT';
 
-  constructor(label: string, timeoutMs: number) {
-    super(`${label} request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+  constructor(label: string, timeoutMs: number, customMessage?: string) {
+    super(
+      customMessage ??
+        `${label} request timed out after ${Math.round(timeoutMs / 1000)} seconds.`,
+    );
     this.name = 'UpstreamTimeoutError';
   }
 }
@@ -140,6 +150,7 @@ async function fetchWithTimeout(
   init: RequestInit,
   timeoutMs: number,
   label: string,
+  customTimeoutMessage?: string,
 ): Promise<globalThis.Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -150,7 +161,7 @@ async function fetchWithTimeout(
     });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new UpstreamTimeoutError(label, timeoutMs);
+      throw new UpstreamTimeoutError(label, timeoutMs, customTimeoutMessage);
     }
     throw error;
   } finally {
@@ -418,6 +429,233 @@ function formatServerProviderError(
   };
 }
 
+function extractGeminiRestText(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') return '';
+  const candidates = (payload as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) return '';
+  const first = candidates[0] as {
+    content?: { parts?: unknown };
+  };
+  const parts = first?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  return parts
+    .map((part) => {
+      if (part && typeof part === 'object' && 'text' in part) {
+        const t = (part as { text?: unknown }).text;
+        return typeof t === 'string' ? t : '';
+      }
+      return '';
+    })
+    .join('')
+    .trim();
+}
+
+/**
+ * Direct raw fetch() POST to the Gemini REST API (bypasses @google/genai SDK).
+ * Calls `https://generativelanguage.googleapis.com/v1beta/models/<model>:generateContent?key=...`
+ * with a 35s AbortController timeout and automatic 404 fallback across supported Flash models.
+ */
+async function callGeminiRestGenerateContent(params: {
+  apiKey: string;
+  model: string;
+  promptText: string;
+  images: InlineImageInput[];
+  systemPrompt?: string;
+  timeoutMs?: number;
+}): Promise<{ text: string; modelUsed: string }> {
+  const {
+    apiKey,
+    model,
+    promptText,
+    images,
+    systemPrompt,
+    timeoutMs = AI_REQUEST_TIMEOUT_MS,
+  } = params;
+
+  const cleanImages = sanitizeInlineImages(images);
+  const parts: Array<
+    | { inline_data: { mime_type: string; data: string } }
+    | { text: string }
+  > = [
+    ...cleanImages.map((img) => ({
+      inline_data: {
+        mime_type: img.mimeType,
+        data: img.data,
+      },
+    })),
+    { text: promptText },
+  ];
+
+  const candidateModels: string[] = [model];
+  for (const fallback of GEMINI_FALLBACK_MODELS) {
+    if (!candidateModels.includes(fallback)) {
+      candidateModels.push(fallback);
+    }
+  }
+
+  let lastError: Error | null = null;
+
+  for (const targetModel of candidateModels) {
+    const endpoint = `${GEMINI_REST_BASE}/${encodeURIComponent(targetModel)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const requestBody: Record<string, unknown> = {
+      contents: [
+        {
+          role: 'user',
+          parts,
+        },
+      ],
+    };
+
+    if (systemPrompt?.trim()) {
+      requestBody.system_instruction = {
+        parts: [{ text: systemPrompt.trim() }],
+      };
+    }
+
+    // Disable hidden thinking tokens on 2.5-flash so OSINT queries respond in ~1-2s instead of stalling
+    if (targetModel === 'gemini-2.5-flash') {
+      requestBody.generationConfig = {
+        thinkingConfig: { thinkingBudget: 0 },
+      };
+    }
+
+    const upstreamRes = await fetchWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      },
+      timeoutMs,
+      `Google Gemini (${targetModel})`,
+      'Network timeout to Google API',
+    );
+
+    const rawText = await upstreamRes.text().catch(() => '');
+    let json: unknown = null;
+    if (rawText) {
+      try {
+        json = JSON.parse(rawText);
+      } catch {
+        json = null;
+      }
+    }
+
+    if (!upstreamRes.ok) {
+      const errMsg =
+        (json ? readApiErrorMessage(json, upstreamRes.status) : '') ||
+        rawText.trim() ||
+        `Google Gemini API returned HTTP ${upstreamRes.status}.`;
+      const err = new Error(errMsg);
+
+      // If this specific model ID is deprecated/not found (404) on the user's API key, try next fallback model
+      if (
+        upstreamRes.status === 404 ||
+        errMsg.includes('NOT_FOUND') ||
+        errMsg.includes('is not found')
+      ) {
+        console.warn(
+          `[api] Gemini REST model "${targetModel}" returned 404 (${errMsg}); trying next fallback...`,
+        );
+        lastError = err;
+        continue;
+      }
+
+      throw err;
+    }
+
+    const text =
+      extractGeminiRestText(json) ||
+      'Gemini returned an empty response for this inspection.';
+    return { text, modelUsed: targetModel };
+  }
+
+  throw lastError ?? new Error('No supported Gemini model was found for this API key.');
+}
+
+/**
+ * Direct raw fetch() POST to the Google Imagen REST API (bypasses @google/genai SDK).
+ */
+async function callGoogleImagenRest(params: {
+  apiKey: string;
+  prompt: string;
+  timeoutMs?: number;
+}): Promise<{ base64Bytes: string; modelUsed: string }> {
+  const { apiKey, prompt, timeoutMs = AI_REQUEST_TIMEOUT_MS } = params;
+  let lastError: Error | null = null;
+
+  for (const candidateModel of IMAGEN_FALLBACK_MODELS) {
+    const endpoint = `${GEMINI_REST_BASE}/${encodeURIComponent(candidateModel)}:predict?key=${encodeURIComponent(apiKey)}`;
+    const upstreamRes = await fetchWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          instances: [{ prompt }],
+          parameters: {
+            sampleCount: 1,
+            aspectRatio: '1:1',
+            outputOptions: { mimeType: 'image/jpeg' },
+          },
+        }),
+      },
+      timeoutMs,
+      `Google Imagen (${candidateModel})`,
+      'Network timeout to Google API',
+    );
+
+    const rawText = await upstreamRes.text().catch(() => '');
+    let json: unknown = null;
+    if (rawText) {
+      try {
+        json = JSON.parse(rawText);
+      } catch {
+        json = null;
+      }
+    }
+
+    if (!upstreamRes.ok) {
+      const errMsg =
+        (json ? readApiErrorMessage(json, upstreamRes.status) : '') ||
+        rawText.trim() ||
+        `Google Imagen API returned HTTP ${upstreamRes.status}.`;
+      const err = new Error(errMsg);
+      if (
+        upstreamRes.status === 404 ||
+        errMsg.includes('NOT_FOUND') ||
+        errMsg.includes('is not found')
+      ) {
+        console.warn(
+          `[api] Imagen REST model "${candidateModel}" returned 404; trying next fallback...`,
+        );
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+
+    const predictions = (json as { predictions?: Array<{ bytesBase64Encoded?: unknown }> } | null)
+      ?.predictions;
+    const base64Bytes =
+      Array.isArray(predictions) &&
+      typeof predictions[0]?.bytesBase64Encoded === 'string'
+        ? predictions[0].bytesBase64Encoded
+        : '';
+
+    if (base64Bytes) {
+      return { base64Bytes, modelUsed: candidateModel };
+    }
+    lastError = new Error(`Imagen API (${candidateModel}) returned no generated image bytes.`);
+  }
+
+  throw lastError ?? new Error('Google Imagen failed to generate image bytes.');
+}
+
 async function executeProviderGeneration(params: {
   provider: LlmProviderId;
   apiKey?: string;
@@ -432,27 +670,19 @@ async function executeProviderGeneration(params: {
   const resolvedModel = normalizeProviderModel(provider, model);
 
   if (provider === 'google') {
-    const ai = getGeminiClient(apiKey);
-    const parts = buildGeminiParts(promptText, images);
-    const response: GenerateContentResponse = await runWithAbortTimeout(
-      (abortSignal) =>
-        ai.models.generateContent({
-          model: resolvedModel,
-          contents: { parts },
-          config: {
-            abortSignal,
-            ...(systemPrompt?.trim()
-              ? { systemInstruction: systemPrompt.trim() }
-              : {}),
-          },
-        }),
-      AI_REQUEST_TIMEOUT_MS,
-      `Google Gemini (${resolvedModel})`,
-    );
-    return (
-      response.text?.trim() ||
-      'Gemini returned an empty response for this inspection.'
-    );
+    const effectiveGeminiKey = resolveEffectiveApiKey(apiKey, 'GEMINI_API_KEY');
+    if (!effectiveGeminiKey) {
+      throw new MissingApiKeyError('Google', 'GEMINI_API_KEY');
+    }
+    const result = await callGeminiRestGenerateContent({
+      apiKey: effectiveGeminiKey,
+      model: resolvedModel,
+      promptText,
+      images,
+      systemPrompt,
+      timeoutMs: AI_REQUEST_TIMEOUT_MS,
+    });
+    return result.text;
   }
 
   const effectiveApiKey = resolveEffectiveApiKey(apiKey, envVarName);
@@ -627,9 +857,13 @@ export async function startServer() {
     const images = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
     const keySource = getKeySourceLabel(requestApiKey, envVarName);
+    const effectiveKeyForLog = resolveEffectiveApiKey(requestApiKey, envVarName);
+    const keyPrefix = effectiveKeyForLog
+      ? `${effectiveKeyForLog.slice(0, 4)}...`
+      : 'NONE';
 
     console.log(
-      `[api] POST ${req.path} received (provider=${providerId}, model=${resolvedModel}, keySource=${keySource}, images=${images.length}, promptChars=${promptText.length})`,
+      `[api] POST ${req.path} received (provider=${providerId}, model=${resolvedModel}, keySource=${keySource}, keyPrefix=${keyPrefix}, images=${images.length}, promptChars=${promptText.length})`,
     );
 
     if (keySource === 'none') {
@@ -692,9 +926,16 @@ export async function startServer() {
     const images = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
     const keySource = getKeySourceLabel(requestApiKey, 'GEMINI_API_KEY');
+    const effectiveGeminiKey = resolveEffectiveApiKey(
+      requestApiKey,
+      'GEMINI_API_KEY',
+    );
+    const keyPrefix = effectiveGeminiKey
+      ? `${effectiveGeminiKey.slice(0, 4)}...`
+      : 'NONE';
 
     console.log(
-      `[api] POST /api/gemini/generate received (model=${resolvedModel}, keySource=${keySource}, images=${images.length})`,
+      `[api] POST /api/gemini/generate received (model=${resolvedModel}, keySource=${keySource}, keyPrefix=${keyPrefix}, images=${images.length})`,
     );
 
     if (keySource === 'none') {
@@ -1088,9 +1329,13 @@ export async function startServer() {
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
     const envVarName = providerId === 'openai' ? 'OPENAI_API_KEY' : 'GEMINI_API_KEY';
     const keySource = getKeySourceLabel(requestApiKey, envVarName);
+    const effectiveKeyForLog = resolveEffectiveApiKey(requestApiKey, envVarName);
+    const keyPrefix = effectiveKeyForLog
+      ? `${effectiveKeyForLog.slice(0, 4)}...`
+      : 'NONE';
 
     console.log(
-      `[api] POST /api/image/generate received (provider=${providerId}, keySource=${keySource}, refImages=${inlineImages.length}, promptChars=${rawPrompt.length})`,
+      `[api] POST /api/image/generate received (provider=${providerId}, keySource=${keySource}, keyPrefix=${keyPrefix}, refImages=${inlineImages.length}, promptChars=${rawPrompt.length})`,
     );
 
     if (providerId === 'openai') {
@@ -1159,31 +1404,33 @@ export async function startServer() {
       return;
     }
 
-    // Provider is Google: Call Imagen API with 30s timeout and model fallback
+    // Provider is Google: Call Imagen REST API directly via raw fetch() (bypasses @google/genai SDK)
+    const geminiKey = resolveEffectiveApiKey(requestApiKey, 'GEMINI_API_KEY');
+    if (!geminiKey) {
+      console.error('[api] POST /api/image/generate rejected (401 MISSING_API_KEY for google)');
+      res.status(401).json({
+        error: MISSING_API_KEY_MESSAGE,
+        code: MISSING_API_KEY_CODE,
+      });
+      return;
+    }
+
     try {
-      const ai = getGeminiClient(requestApiKey);
       let finalPrompt = rawPrompt;
 
-      // If connected ImageNodes were passed, optionally extract brief visual traits (capped at 10s)
+      // If connected ImageNodes were passed, optionally extract brief visual traits via raw Gemini REST (capped at 10s)
       if (inlineImages.length > 0) {
         try {
-          const visionParts = buildGeminiParts(
-            'Summarize the key physical subject, attire, and facial/structural traits visible in this reference frame in 2 concise sentences for a forensic composite.',
-            inlineImages,
-          );
-          const visionSummary = await runWithAbortTimeout(
-            (abortSignal) =>
-              ai.models.generateContent({
-                model: DEFAULT_GEMINI_MODEL,
-                contents: { parts: visionParts },
-                config: { abortSignal },
-              }),
-            10_000,
-            'Google Gemini Vision Enrichment',
-          );
-          const summaryText = visionSummary.text?.trim();
-          if (summaryText) {
-            finalPrompt = `${rawPrompt} | Visual Traits from Connected ImageNode: ${summaryText}`;
+          const visionResult = await callGeminiRestGenerateContent({
+            apiKey: geminiKey,
+            model: DEFAULT_GEMINI_MODEL,
+            promptText:
+              'Summarize the key physical subject, attire, and facial/structural traits visible in this reference frame in 2 concise sentences for a forensic composite.',
+            images: inlineImages,
+            timeoutMs: 10_000,
+          });
+          if (visionResult.text) {
+            finalPrompt = `${rawPrompt} | Visual Traits from Connected ImageNode: ${visionResult.text}`;
           }
         } catch (visionErr) {
           console.warn(
@@ -1192,51 +1439,11 @@ export async function startServer() {
         }
       }
 
-      let base64Bytes: string | undefined;
-      let modelUsed: string = IMAGEN_MODEL_ID;
-      let lastError: unknown = null;
-
-      for (const candidateModel of IMAGEN_FALLBACK_MODELS) {
-        try {
-          const imagenResponse = await runWithAbortTimeout(
-            (abortSignal) =>
-              ai.models.generateImages({
-                model: candidateModel,
-                prompt: finalPrompt,
-                config: {
-                  abortSignal,
-                  numberOfImages: 1,
-                  outputMimeType: 'image/jpeg',
-                  aspectRatio: '1:1',
-                },
-              }),
-            AI_REQUEST_TIMEOUT_MS,
-            `Google Imagen (${candidateModel})`,
-          );
-          base64Bytes = imagenResponse.generatedImages?.[0]?.image?.imageBytes;
-          modelUsed = candidateModel;
-          if (base64Bytes) break;
-        } catch (candidateErr) {
-          lastError = candidateErr;
-          const msg =
-            candidateErr instanceof Error ? candidateErr.message : String(candidateErr);
-          // Only fall back to newer Imagen model IDs if the model ID was NOT_FOUND
-          if (msg.includes('NOT_FOUND') || msg.includes('is not found')) {
-            console.warn(
-              `[api] Imagen model ${candidateModel} unavailable, trying next fallback...`,
-            );
-            continue;
-          }
-          throw candidateErr;
-        }
-      }
-
-      if (!base64Bytes) {
-        if (lastError) throw lastError;
-        throw new Error(
-          `Imagen API (${modelUsed}) returned no generated image bytes.`,
-        );
-      }
+      const { base64Bytes, modelUsed } = await callGoogleImagenRest({
+        apiKey: geminiKey,
+        prompt: finalPrompt,
+        timeoutMs: AI_REQUEST_TIMEOUT_MS,
+      });
 
       console.log(
         `[api] POST /api/image/generate succeeded (provider=google, model=${modelUsed})`,

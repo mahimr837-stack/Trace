@@ -87,11 +87,12 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
     endpointLabel: '/api/llm/generate (Gemini SDK)',
     endpointUrl: '/api/gemini/generate',
     consoleUrl: 'https://aistudio.google.com/apikey',
-    defaultModel: 'gemini-2.5-flash',
+    defaultModel: 'gemini-1.5-flash',
     models: [
+      'gemini-1.5-flash',
+      'gemini-2.0-flash',
       'gemini-2.5-flash',
       'gemini-2.5-pro',
-      'gemini-2.0-flash',
     ],
     keyPlaceholder: 'GEMINI_API_KEY (Server Secret)',
     supportsVision: true,
@@ -486,7 +487,7 @@ export function buildLlmProxyRequest(params: {
   };
 }
 
-const CLIENT_AI_TIMEOUT_MS = 35_000;
+const CLIENT_AI_TIMEOUT_MS = 40_000;
 
 /**
  * Executes a multimodal OSINT inspection request via the backend API proxy layer (`/api/llm/generate`).

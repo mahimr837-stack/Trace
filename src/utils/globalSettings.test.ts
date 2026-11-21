@@ -237,7 +237,7 @@ test('AI utilities pass global API key in both x-api-key header and JSON body', 
   mockStorage.clear();
 });
 
-test('auto-migrates legacy gemini-4-hydrogen model to gemini-2.5-flash and aborts hung requests on timeout', async () => {
+test('auto-migrates legacy gemini-4-hydrogen model to gemini-1.5-flash and aborts hung requests on timeout', async () => {
   const mockStorage = createMemoryStorage();
   Object.defineProperty(globalThis, 'localStorage', {
     value: mockStorage,
@@ -258,8 +258,8 @@ test('auto-migrates legacy gemini-4-hydrogen model to gemini-2.5-flash and abort
   );
 
   const migrated = readGlobalSettings();
-  assert.equal(migrated.model, 'gemini-2.5-flash');
-  assert.equal(migrated.providerConfigs.google.model, 'gemini-2.5-flash');
+  assert.equal(migrated.model, 'gemini-1.5-flash');
+  assert.equal(migrated.providerConfigs.google.model, 'gemini-1.5-flash');
 
   const hangingFetch = ((_url: string | URL | Request, init?: RequestInit) =>
     new Promise<Response>((_resolve, reject) => {
