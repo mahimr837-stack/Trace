@@ -51,7 +51,7 @@ test('builds unified server-side LLM proxy request payload without client API ke
   });
 
   const geminiSpec = buildGeminiServerRequest({
-    model: 'gemini-4-hydrogen',
+    model: 'gemini-1.5-flash',
     promptText: 'Inspect crane shadow azimuth.',
     images: [{ mimeType: 'image/png', data: 'BASE64PNG' }],
     systemPrompt: 'You are a GEOINT analyst.',

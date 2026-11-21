@@ -16,6 +16,8 @@ import {
   extractAnthropicResponseText,
   extractOpenAiResponseText,
   getProviderMeta,
+  INVALID_GEMINI_MODEL_ERROR,
+  isValidGeminiModelName,
   LLM_PROVIDERS,
   normalizeProviderModel,
   readApiErrorMessage,
@@ -48,7 +50,7 @@ try {
   // Ignore on runtimes that do not support setDefaultResultOrder
 }
 
-const AI_REQUEST_TIMEOUT_MS = 35_000;
+const AI_REQUEST_TIMEOUT_MS = 60_000;
 const GEMINI_REST_BASE =
   'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_GEMINI_MODEL = 'gemini-1.5-flash';
@@ -374,7 +376,7 @@ function formatServerProviderError(
     return {
       status: 504,
       code: 'UPSTREAM_TIMEOUT',
-      message: `${providerName} request timed out after 30 seconds.`,
+      message: `${providerName} request timed out after 60 seconds.`,
     };
   }
 
@@ -849,6 +851,20 @@ export async function startServer() {
       LLM_PROVIDERS.some((p) => p.id === body.provider)
         ? body.provider
         : 'google';
+
+    const rawModel = typeof body.model === 'string' ? body.model.trim() : '';
+    if (
+      rawModel &&
+      (rawModel.toLowerCase().includes('gemini') || providerId === 'google') &&
+      !isValidGeminiModelName(rawModel)
+    ) {
+      console.error(
+        `[api] POST ${req.path} rejected (400 INVALID_GEMINI_MODEL: "${rawModel}")`,
+      );
+      res.status(400).json({ error: INVALID_GEMINI_MODEL_ERROR });
+      return;
+    }
+
     const meta = getProviderMeta(providerId);
     const envVarName = PROVIDER_ENV_KEYS[providerId] ?? meta.envVarName;
     const resolvedModel = normalizeProviderModel(providerId, body.model);
@@ -920,6 +936,15 @@ export async function startServer() {
       return;
     }
 
+    const rawModel = typeof body.model === 'string' ? body.model.trim() : '';
+    if (rawModel && !isValidGeminiModelName(rawModel)) {
+      console.error(
+        `[api] POST /api/gemini/generate rejected (400 INVALID_GEMINI_MODEL: "${rawModel}")`,
+      );
+      res.status(400).json({ error: INVALID_GEMINI_MODEL_ERROR });
+      return;
+    }
+
     const resolvedModel = normalizeProviderModel('google', body.model);
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
@@ -984,6 +1009,15 @@ export async function startServer() {
 
     if (!promptText) {
       res.status(400).json({ error: 'promptText is required.' });
+      return;
+    }
+
+    const rawModel = typeof body.model === 'string' ? body.model.trim() : '';
+    if (rawModel && !isValidGeminiModelName(rawModel)) {
+      console.error(
+        `[api] POST /api/gemini/stream rejected (400 INVALID_GEMINI_MODEL: "${rawModel}")`,
+      );
+      res.status(400).json({ error: INVALID_GEMINI_MODEL_ERROR });
       return;
     }
 

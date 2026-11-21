@@ -72,7 +72,7 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
     models: [
       'anthropic/claude-3.5-sonnet',
       'openai/gpt-4o',
-      'google/gemini-2.5-flash',
+      'google/gemini-2.0-flash-001',
       'deepseek/deepseek-chat',
     ],
     keyPlaceholder: 'OPENROUTER_API_KEY (Server Secret)',
@@ -84,19 +84,19 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
     id: 'google',
     name: 'Google',
     envVarName: 'GEMINI_API_KEY',
-    endpointLabel: '/api/llm/generate (Gemini SDK)',
+    endpointLabel: '/api/llm/generate (Gemini REST)',
     endpointUrl: '/api/gemini/generate',
     consoleUrl: 'https://aistudio.google.com/apikey',
     defaultModel: 'gemini-1.5-flash',
     models: [
       'gemini-1.5-flash',
+      'gemini-1.5-pro',
       'gemini-2.0-flash',
-      'gemini-2.5-flash',
-      'gemini-2.5-pro',
+      'gemini-2.0-pro',
     ],
     keyPlaceholder: 'GEMINI_API_KEY (Server Secret)',
     supportsVision: true,
-    description: 'Server-side Google GenAI SDK for multimodal Gemini inspection.',
+    description: 'Server-side Google Gemini REST API for multimodal OSINT inspection.',
   },
   {
     id: 'deepseek',
@@ -132,11 +132,45 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
   },
 ] as const;
 
-const LEGACY_GEMINI_MODELS = new Set([
-  'gemini-4-hydrogen',
-  'gemini-4-argon',
-  'gemini-3.1-flash-lite',
-]);
+export const NON_VISION_MODEL_WARNING =
+  'This model does not support image analysis. Please select a Vision model like Gemini, GPT-4o, or Claude 3.5.';
+
+export const INVALID_GEMINI_MODEL_ERROR = 'Invalid Gemini model name';
+
+const VALID_GEMINI_MODEL_RE =
+  /^(?:google\/)?gemini-(?:1\.5-flash(?:-8b)?|1\.5-pro|2\.0-flash(?:-lite|-exp)?|2\.0-pro(?:-exp)?|2\.5-flash(?:-lite)?|2\.5-pro)(?:-(?:001|002|latest|exp|preview)(?:-[\w-]+)?)?$/i;
+
+const NON_VISION_MODEL_NAME_RE =
+  /(?:^|[\/_-])(?:recraft|flux|sdxl|stable-diffusion|midjourney|dall-e|imagen|ideogram|kandinsky|playground-v|whisper|tts|text-embedding|embedding|bge-|rerank|deepseek-chat|deepseek-reasoner|deepseek-r1|o1-mini|o3-mini|codestral|qwen-2\.5-coder|mistral-7b|mixtral-8x)(?:$|[\/_.-]|\d)/i;
+
+/**
+ * Validates that any model identifier containing "gemini" conforms to an official
+ * Google Gemini model format (e.g. `gemini-1.5-flash`, `gemini-2.0-flash`).
+ */
+export function isValidGeminiModelName(model: string): boolean {
+  const trimmed = model.trim();
+  if (!trimmed) return false;
+  if (!trimmed.toLowerCase().includes('gemini')) return true;
+  return VALID_GEMINI_MODEL_RE.test(trimmed);
+}
+
+/**
+ * Determines whether a selected provider + model supports multimodal image analysis.
+ * Rejects text-only providers (e.g. DeepSeek) and non-vision / image-gen models (e.g. `recraft`, `flux`, `sdxl`).
+ */
+export function isVisionCapableModel(
+  providerId: LlmProviderId,
+  model?: string | null,
+): boolean {
+  const meta = getProviderMeta(providerId);
+  if (!meta.supportsVision) return false;
+  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!trimmed) return true;
+  if (NON_VISION_MODEL_NAME_RE.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
 
 export function normalizeProviderModel(
   providerId: LlmProviderId,
@@ -145,8 +179,10 @@ export function normalizeProviderModel(
   const meta = getProviderMeta(providerId);
   const trimmed = typeof model === 'string' ? model.trim() : '';
   if (!trimmed) return meta.defaultModel;
-  if (providerId === 'google' && LEGACY_GEMINI_MODELS.has(trimmed)) {
-    return meta.defaultModel;
+  if (trimmed.toLowerCase().includes('gemini') && !isValidGeminiModelName(trimmed)) {
+    return providerId === 'openrouter'
+      ? 'google/gemini-2.0-flash-001'
+      : getProviderMeta('google').defaultModel;
   }
   return trimmed;
 }
@@ -487,7 +523,7 @@ export function buildLlmProxyRequest(params: {
   };
 }
 
-const CLIENT_AI_TIMEOUT_MS = 40_000;
+const CLIENT_AI_TIMEOUT_MS = 60_000;
 
 /**
  * Executes a multimodal OSINT inspection request via the backend API proxy layer (`/api/llm/generate`).
@@ -513,6 +549,10 @@ export async function runMultiProviderAnalysis(params: {
     params.model ?? globalSettings.model,
   );
   const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
+
+  if (params.images.length > 0 && !isVisionCapableModel(provider, model)) {
+    throw new Error(NON_VISION_MODEL_WARNING);
+  }
 
   const spec = buildLlmProxyRequest({
     provider,

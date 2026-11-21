@@ -307,7 +307,7 @@ export async function requestTargetImageGeneration(params: {
   });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 40_000);
+  const timer = setTimeout(() => controller.abort(), 60_000);
 
   let response: Response;
   try {
@@ -321,7 +321,7 @@ export async function requestTargetImageGeneration(params: {
     const isAbort = error instanceof Error && error.name === 'AbortError';
     if (isAbort) {
       throw new Error(
-        'Target image generation timed out after 40s. Check your network or API key.',
+        'Target image generation timed out after 60s. Check your network or API key.',
       );
     }
     throw new Error(

@@ -16,7 +16,10 @@ import {
 } from '../utils/globalSettings';
 import {
   getProviderMeta,
+  isVisionCapableModel,
   LLM_PROVIDERS,
+  NON_VISION_MODEL_WARNING,
+  normalizeProviderModel,
   type LlmProviderId,
 } from '../utils/llmProviders';
 
@@ -57,8 +60,15 @@ function GlobalSettingsDialogContent({ onClose }: { onClose: () => void }) {
     apiKey: '',
     model: currentMeta.defaultModel,
   };
-  const resolvedModel = currentDraft.model.trim() || currentMeta.defaultModel;
+  const resolvedModel = normalizeProviderModel(
+    selectedProvider,
+    currentDraft.model,
+  );
   const hasKeyConfigured = Boolean(currentDraft.apiKey.trim());
+  const supportsVisionForDraft = isVisionCapableModel(
+    selectedProvider,
+    currentDraft.model.trim() || resolvedModel,
+  );
 
   const updateCurrentDraft = (patch: Partial<ProviderConfigEntry>) => {
     setDraftConfigs((prev) => ({
@@ -239,9 +249,11 @@ function GlobalSettingsDialogContent({ onClose }: { onClose: () => void }) {
                   data-testid="global-model-select"
                   aria-label="Preset Model"
                   value={
-                    currentMeta.models.includes(currentDraft.model)
-                      ? currentDraft.model
-                      : '__custom__'
+                    currentMeta.models.includes(resolvedModel)
+                      ? resolvedModel
+                      : selectedProvider === 'google'
+                        ? currentMeta.defaultModel
+                        : '__custom__'
                   }
                   onChange={(e) => {
                     if (e.target.value !== '__custom__') {
@@ -255,9 +267,10 @@ function GlobalSettingsDialogContent({ onClose }: { onClose: () => void }) {
                       {modelId}
                     </option>
                   ))}
-                  {!currentMeta.models.includes(currentDraft.model) && (
-                    <option value="__custom__">Custom</option>
-                  )}
+                  {selectedProvider !== 'google' &&
+                    !currentMeta.models.includes(currentDraft.model) && (
+                      <option value="__custom__">Custom</option>
+                    )}
                 </select>
               </div>
             </div>
@@ -265,12 +278,23 @@ function GlobalSettingsDialogContent({ onClose }: { onClose: () => void }) {
               id="global-model-custom"
               data-testid="global-model-custom-input"
               type="text"
-              value={currentDraft.model}
+              value={
+                selectedProvider === 'google' ? resolvedModel : currentDraft.model
+              }
               onChange={(e) => updateCurrentDraft({ model: e.target.value })}
               placeholder={currentMeta.defaultModel}
               spellCheck={false}
               className="font-mono-tabular w-full rounded-lg border border-neutral-200 bg-neutral-50/70 px-2.5 py-2 text-xs text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-400 focus:bg-white focus:outline-none"
             />
+            {!supportsVisionForDraft && (
+              <p
+                role="alert"
+                data-testid="non-vision-model-warning"
+                className="mt-1.5 rounded-lg border border-amber-200 bg-amber-50/80 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-800"
+              >
+                {NON_VISION_MODEL_WARNING}
+              </p>
+            )}
           </div>
 
           {/* 4. Shodan API Key (OSINT Infrastructure Lookup) */}

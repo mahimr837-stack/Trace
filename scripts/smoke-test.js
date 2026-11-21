@@ -133,6 +133,22 @@ check(
   `HTTP ${imageNoKey[0]}, code=${imageNoKey[1]?.code}`,
 );
 
+const invalidGeminiModel = await fetch(`${BASE}/api/llm/complete`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    provider: 'google',
+    model: 'gemini-99-nonexistent',
+    promptText: 'Ping',
+  }),
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'POST /api/llm/complete rejects invalid Gemini model name immediately',
+  invalidGeminiModel[0] === 400 &&
+    invalidGeminiModel[1]?.error === 'Invalid Gemini model name',
+  `HTTP ${invalidGeminiModel[0]}, error=${invalidGeminiModel[1]?.error}`,
+);
+
 // 3e. Local Filesystem Project Persistence (/api/projects/save, /api/projects, /api/projects/:id, DELETE)
 const smokeProjId = `smoke-proj-${Date.now()}`;
 const saveProj = await fetch(`${BASE}/api/projects/save`, {

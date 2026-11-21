@@ -237,7 +237,8 @@ test('AI utilities pass global API key in both x-api-key header and JSON body', 
   mockStorage.clear();
 });
 
-test('auto-migrates legacy gemini-4-hydrogen model to gemini-1.5-flash and aborts hung requests on timeout', async () => {
+test('auto-migrates invalid Gemini model names to gemini-1.5-flash, blocks non-vision models like recraft, and aborts hung requests on timeout', async () => {
+  const { NON_VISION_MODEL_WARNING } = await import('./llmProviders');
   const mockStorage = createMemoryStorage();
   Object.defineProperty(globalThis, 'localStorage', {
     value: mockStorage,
@@ -250,9 +251,9 @@ test('auto-migrates legacy gemini-4-hydrogen model to gemini-1.5-flash and abort
     JSON.stringify({
       provider: 'google',
       apiKey: 'AIzaSyTestKey',
-      model: 'gemini-4-hydrogen',
+      model: 'gemini-99-invalid',
       providerConfigs: {
-        google: { apiKey: 'AIzaSyTestKey', model: 'gemini-4-hydrogen' },
+        google: { apiKey: 'AIzaSyTestKey', model: 'gemini-99-invalid' },
       },
     }),
   );
@@ -260,6 +261,21 @@ test('auto-migrates legacy gemini-4-hydrogen model to gemini-1.5-flash and abort
   const migrated = readGlobalSettings();
   assert.equal(migrated.model, 'gemini-1.5-flash');
   assert.equal(migrated.providerConfigs.google.model, 'gemini-1.5-flash');
+
+  // Non-vision models like recraft are intercepted on the frontend when images are attached
+  await assert.rejects(
+    () =>
+      runMultiProviderAnalysis({
+        provider: 'openrouter',
+        apiKey: 'sk-or-test',
+        model: 'recraft-v3',
+        promptText: 'Analyze image.',
+        images: [{ mimeType: 'image/png', data: 'AAA' }],
+      }),
+    {
+      message: NON_VISION_MODEL_WARNING,
+    },
+  );
 
   const hangingFetch = ((_url: string | URL | Request, init?: RequestInit) =>
     new Promise<Response>((_resolve, reject) => {

@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import {
   getProviderMeta,
+  isVisionCapableModel,
   LLM_PROVIDERS,
+  NON_VISION_MODEL_WARNING,
   runMultiProviderAnalysis,
   type LlmProviderId,
 } from '../utils/llmProviders';
@@ -2060,6 +2062,20 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return false;
     }
 
+    if (
+      (hasImages || hasEnhanced || imagesWithData.length > 0) &&
+      !isVisionCapableModel(activeProvider, resolvedModel)
+    ) {
+      set((state) => ({
+        alertMessage: NON_VISION_MODEL_WARNING,
+        chatNodeErrors: {
+          ...state.chatNodeErrors,
+          [chatNodeId]: NON_VISION_MODEL_WARNING,
+        },
+      }));
+      return false;
+    }
+
     set((state) => ({
       alertMessage: null,
       chatNodeErrors: {
@@ -2409,11 +2425,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return { ok: false, error: msg };
     }
 
-    const providerMeta = getProviderMeta(activeProvider);
-    if (!providerMeta.supportsVision) {
-      const msg = `${providerMeta.name} does not support image vision inputs. Select Google, OpenAI, OpenRouter, or Anthropic in Dashboard Settings.`;
-      set({ alertMessage: msg });
-      return { ok: false, error: msg };
+    if (!isVisionCapableModel(activeProvider, globalSettings.model)) {
+      set({ alertMessage: NON_VISION_MODEL_WARNING });
+      return { ok: false, error: NON_VISION_MODEL_WARNING };
     }
 
     set((state) => ({
