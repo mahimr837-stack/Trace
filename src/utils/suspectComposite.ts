@@ -1,7 +1,9 @@
 import type { Edge } from 'reactflow';
 import type { OsintNode } from '../types/osint';
 import {
+  ApiAuthError,
   getGlobalApiKey,
+  MISSING_API_KEY_CODE,
   MISSING_API_KEY_MESSAGE,
   readGlobalSettings,
 } from './globalSettings';
@@ -249,7 +251,8 @@ export interface ServerImageGenerationRequestSpec {
 
 /**
  * Builds the client-to-server request spec for `/api/image/generate`.
- * Pulls the global API key from localStorage when available.
+ * Pulls the global API key from localStorage when available and forwards it
+ * via both the `x-api-key` header and JSON body.
  */
 export function buildServerImageGenerationRequest(params: {
   provider?: LlmProviderId;
@@ -266,6 +269,7 @@ export function buildServerImageGenerationRequest(params: {
     url: SERVER_IMAGE_GENERATE_ENDPOINT,
     headers: {
       'Content-Type': 'application/json',
+      ...(resolvedApiKey ? { 'x-api-key': resolvedApiKey } : {}),
     },
     body: {
       provider: resolvedProvider,
@@ -279,7 +283,8 @@ export function buildServerImageGenerationRequest(params: {
 /**
  * Calls the backend `/api/image/generate` proxy endpoint to generate a forensic composite image
  * using Google Imagen (`imagen-3.0-generate-001`) or OpenAI DALL-E 3 (`dall-e-3`).
- * Pulls the active provider and API key from global localStorage settings.
+ * Pulls the active provider and API key from global localStorage settings, or lets the server
+ * fall back to `.env` / return HTTP 401 when neither is configured.
  */
 export async function requestTargetImageGeneration(params: {
   provider?: LlmProviderId;
@@ -293,14 +298,10 @@ export async function requestTargetImageGeneration(params: {
   const resolvedApiKey =
     params.apiKey?.trim() || getGlobalApiKey(resolvedProvider);
 
-  if (!resolvedApiKey) {
-    throw new Error(MISSING_API_KEY_MESSAGE);
-  }
-
   const fetchFn = params.fetchImpl ?? fetch;
   const spec = buildServerImageGenerationRequest({
     provider: resolvedProvider,
-    apiKey: resolvedApiKey,
+    apiKey: resolvedApiKey || undefined,
     prompt: params.prompt,
     images: params.images,
   });
@@ -316,6 +317,7 @@ export async function requestTargetImageGeneration(params: {
     model?: unknown;
     error?: unknown;
     message?: unknown;
+    code?: unknown;
   } | null;
 
   if (!response.ok) {
@@ -325,6 +327,13 @@ export async function requestTargetImageGeneration(params: {
         typeof payload.message === 'string' &&
         payload.message.trim()) ||
       `Target image generation failed with HTTP ${response.status}.`;
+    if (response.status === 401) {
+      const code =
+        payload && typeof payload.code === 'string' && payload.code.trim()
+          ? payload.code.trim()
+          : MISSING_API_KEY_CODE;
+      throw new ApiAuthError(errMsg || MISSING_API_KEY_MESSAGE, 401, code);
+    }
     throw new Error(errMsg);
   }
 

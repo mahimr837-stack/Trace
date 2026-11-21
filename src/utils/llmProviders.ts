@@ -1,6 +1,8 @@
 import type { ParsedInlineImage } from './osintGraph';
 import {
+  ApiAuthError,
   getGlobalApiKey,
+  MISSING_API_KEY_CODE,
   MISSING_API_KEY_MESSAGE,
   readGlobalSettings,
 } from './globalSettings';
@@ -377,6 +379,7 @@ export interface GeminiServerRequestSpec {
     promptText: string;
     images: ParsedInlineImage[];
     systemPrompt?: string;
+    apiKey?: string;
   };
 }
 
@@ -388,13 +391,16 @@ export function buildGeminiServerRequest(params: {
   promptText: string;
   images: ParsedInlineImage[];
   systemPrompt?: string;
+  apiKey?: string;
 }): GeminiServerRequestSpec {
   const meta = getProviderMeta('google');
   const resolvedModel = params.model.trim() || meta.defaultModel;
+  const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey('google');
   return {
     url: '/api/gemini/generate',
     headers: {
       'Content-Type': 'application/json',
+      ...(resolvedApiKey ? { 'x-api-key': resolvedApiKey } : {}),
     },
     body: {
       model: resolvedModel,
@@ -403,6 +409,7 @@ export function buildGeminiServerRequest(params: {
       ...(params.systemPrompt?.trim()
         ? { systemPrompt: params.systemPrompt.trim() }
         : {}),
+      ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
     },
   };
 }
@@ -423,7 +430,8 @@ export interface LlmProxyRequestSpec {
 /**
  * Builds a unified server-side LLM proxy request payload for any provider
  * (Google Gemini, Anthropic, OpenAI, OpenRouter, DeepSeek, or Mistral).
- * Pulls the global API key from localStorage when available.
+ * Pulls the global API key from localStorage when available and forwards it
+ * via both the `x-api-key` header and JSON body.
  */
 export function buildLlmProxyRequest(params: {
   provider?: LlmProviderId;
@@ -445,6 +453,7 @@ export function buildLlmProxyRequest(params: {
     url: '/api/llm/generate',
     headers: {
       'Content-Type': 'application/json',
+      ...(resolvedApiKey ? { 'x-api-key': resolvedApiKey } : {}),
     },
     body: {
       provider: resolvedProvider,
@@ -462,6 +471,8 @@ export function buildLlmProxyRequest(params: {
 /**
  * Executes a multimodal OSINT inspection request via the backend API proxy layer (`/api/llm/generate`).
  * Pulls the active provider, model, and API key from global localStorage settings.
+ * If no client key is configured, the request is still sent so the server can fall back to `.env`,
+ * or return HTTP 401 so the UI can prompt the user to configure Settings.
  */
 export async function runMultiProviderAnalysis(params: {
   provider?: LlmProviderId;
@@ -479,13 +490,9 @@ export async function runMultiProviderAnalysis(params: {
     (params.model ?? globalSettings.model).trim() || meta.defaultModel;
   const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
 
-  if (!resolvedApiKey) {
-    throw new Error(MISSING_API_KEY_MESSAGE);
-  }
-
   const spec = buildLlmProxyRequest({
     provider,
-    apiKey: resolvedApiKey,
+    apiKey: resolvedApiKey || undefined,
     model,
     promptText: params.promptText,
     images: params.images,
@@ -503,10 +510,19 @@ export async function runMultiProviderAnalysis(params: {
     text?: unknown;
     error?: unknown;
     message?: unknown;
+    code?: unknown;
   } | null;
 
   if (!res.ok) {
-    throw new Error(readApiErrorMessage(json, res.status));
+    const errMsg = readApiErrorMessage(json, res.status);
+    if (res.status === 401) {
+      const code =
+        json && typeof json.code === 'string' && json.code.trim()
+          ? json.code.trim()
+          : MISSING_API_KEY_CODE;
+      throw new ApiAuthError(errMsg || MISSING_API_KEY_MESSAGE, 401, code);
+    }
+    throw new Error(errMsg);
   }
 
   const text = json && typeof json.text === 'string' ? json.text.trim() : '';

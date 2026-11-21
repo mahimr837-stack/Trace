@@ -41,6 +41,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
   const deleteProject = useCanvasStore((state) => state.deleteProject);
   const renameProject = useCanvasStore((state) => state.renameProject);
   const loadProject = useCanvasStore((state) => state.loadProject);
+  const fetchProjectsFromServer = useCanvasStore(
+    (state) => state.fetchProjectsFromServer,
+  );
 
   const [newProjectName, setNewProjectName] = useState('');
   const [openMenuProjectId, setOpenMenuProjectId] = useState<string | null>(null);
@@ -49,6 +52,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    void fetchProjectsFromServer();
+  }, [fetchProjectsFromServer]);
 
   useEffect(() => {
     if (renamingProjectId && renameInputRef.current) {
@@ -382,13 +389,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectProject }) => {
                     <div className="flex items-center gap-3">
                       <span className="inline-flex items-center gap-1">
                         <Layers className="h-3.5 w-3.5 text-neutral-400" />
-                        {project.nodes.length}{' '}
-                        {project.nodes.length === 1 ? 'node' : 'nodes'}
+                        {project.nodeCount ?? project.nodes.length}{' '}
+                        {(project.nodeCount ?? project.nodes.length) === 1
+                          ? 'node'
+                          : 'nodes'}
                       </span>
                       <span className="inline-flex items-center gap-1">
                         <GitBranch className="h-3.5 w-3.5 text-neutral-400" />
-                        {project.edges.length}{' '}
-                        {project.edges.length === 1 ? 'edge' : 'edges'}
+                        {project.edgeCount ?? project.edges.length}{' '}
+                        {(project.edgeCount ?? project.edges.length) === 1
+                          ? 'edge'
+                          : 'edges'}
                       </span>
                     </div>
                     <span className="text-[11px] font-medium text-neutral-700 opacity-0 transition-opacity group-hover:opacity-100">

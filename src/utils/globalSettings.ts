@@ -10,10 +10,36 @@ export const GLOBAL_API_KEY_STORAGE_KEY = 'traceboard_api_key';
 export const GLOBAL_MODEL_STORAGE_KEY = 'traceboard_model';
 export const GLOBAL_SHODAN_KEY_STORAGE_KEY = 'traceboard_shodan_api_key';
 
+export const MISSING_API_KEY_CODE = 'MISSING_API_KEY';
 export const MISSING_API_KEY_MESSAGE =
   'Please set your API key in the Dashboard Settings.';
 export const MISSING_SHODAN_KEY_MESSAGE =
   'Please set your Shodan API key in the Dashboard Settings (or in this node).';
+
+export class ApiAuthError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(
+    message = MISSING_API_KEY_MESSAGE,
+    status = 401,
+    code = MISSING_API_KEY_CODE,
+  ) {
+    super(message);
+    this.name = 'ApiAuthError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function isApiAuthError(error: unknown): error is ApiAuthError {
+  return (
+    error instanceof ApiAuthError ||
+    (error instanceof Error &&
+      'status' in error &&
+      (error as { status?: unknown }).status === 401)
+  );
+}
 
 export interface ProviderConfigEntry {
   apiKey: string;

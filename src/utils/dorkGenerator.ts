@@ -1,6 +1,5 @@
 import {
   getGlobalApiKey,
-  MISSING_API_KEY_MESSAGE,
   readGlobalSettings,
 } from './globalSettings';
 import {
@@ -93,10 +92,6 @@ export async function generateGoogleDorks(params: {
     (params.model ?? globalSettings.model).trim() || meta.defaultModel;
   const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
 
-  if (!resolvedApiKey) {
-    throw new Error(MISSING_API_KEY_MESSAGE);
-  }
-
   const userPrompt = buildDorkUserPrompt(
     params.targetType,
     params.extractedSourceText,
@@ -104,7 +99,7 @@ export async function generateGoogleDorks(params: {
 
   const rawOutput = await runMultiProviderAnalysis({
     provider,
-    apiKey: resolvedApiKey,
+    apiKey: resolvedApiKey || undefined,
     model,
     systemPrompt: DORK_SYSTEM_PROMPT,
     promptText: userPrompt,

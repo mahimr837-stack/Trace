@@ -11,9 +11,13 @@ export interface OsintProject {
   id: string;
   name: string;
   createdAt: string;
+  updatedAt?: string;
   nodes: OsintNode[];
   edges: Edge[];
   nodeCounter?: number;
+  nodeCount?: number;
+  edgeCount?: number;
+  isSummaryOnly?: boolean;
 }
 
 export interface ImageNodeData {

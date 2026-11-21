@@ -33,6 +33,7 @@ import {
   ScanSearch,
   ScanText,
   Server,
+  Settings,
   Sparkles,
   Terminal,
   Trash2,
@@ -61,6 +62,7 @@ import { SuspectNode } from './components/nodes/SuspectNode';
 import { ShodanNode } from './components/nodes/ShodanNode';
 import { ArchiveNode } from './components/nodes/ArchiveNode';
 import { Dashboard } from './components/Dashboard';
+import { GlobalSettingsModal } from './components/GlobalSettingsModal';
 import { RedBezierEdge } from './components/edges/RedBezierEdge';
 import { flushPendingCanvasSave, useCanvasStore } from './store/useCanvasStore';
 import {
@@ -120,6 +122,7 @@ interface OsintCanvasProps {
 function OsintCanvas({ projectId, onBackToDashboard }: OsintCanvasProps) {
   const [draggedNodeType, setDraggedNodeType] = useState<DeployableOsintNodeType | null>(null);
   const [isDropActive, setIsDropActive] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const projects = useCanvasStore((state) => state.projects);
   const currentProjectId = useCanvasStore((state) => state.currentProjectId);
@@ -720,14 +723,31 @@ function OsintCanvas({ projectId, onBackToDashboard }: OsintCanvasProps) {
                 <AlertCircle className="h-4 w-4 shrink-0 text-red-600" aria-hidden="true" />
                 <span>{alertMessage}</span>
               </div>
-              <button
-                type="button"
-                onClick={clearAlert}
-                aria-label="Dismiss alert"
-                className="rounded p-1 text-red-400 transition-colors hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {(alertMessage.toLowerCase().includes('api key') ||
+                  alertMessage.toLowerCase().includes('settings')) && (
+                  <button
+                    type="button"
+                    data-testid="alert-open-settings-btn"
+                    onClick={() => {
+                      clearAlert();
+                      setIsSettingsOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-md bg-neutral-900 px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-neutral-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 cursor-pointer"
+                  >
+                    <Settings className="h-3 w-3" aria-hidden="true" />
+                    <span>Open Settings</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={clearAlert}
+                  aria-label="Dismiss alert"
+                  className="rounded p-1 text-red-400 transition-colors hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
           )}
         </Panel>
@@ -784,6 +804,11 @@ function OsintCanvas({ projectId, onBackToDashboard }: OsintCanvasProps) {
           </div>
         </div>
       )}
+
+      <GlobalSettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+      />
     </main>
   );
 }

@@ -64,6 +64,7 @@ import { generateGoogleDorks } from '../utils/dorkGenerator';
 import {
   getGlobalApiKey,
   getGlobalShodanApiKey,
+  isApiAuthError,
   MISSING_API_KEY_MESSAGE,
   MISSING_SHODAN_KEY_MESSAGE,
   readGlobalSettings,
@@ -99,6 +100,12 @@ import {
   requestTargetImageGeneration,
   resolveSuspectContextForNode,
 } from '../utils/suspectComposite';
+import {
+  deleteProjectOnServer,
+  fetchProjectById,
+  fetchProjectList,
+  saveProjectToServer,
+} from '../utils/projectApi';
 
 const PORT_AERIAL_URL = '/src/assets/images/osint_port_aerial_1794763184788.jpg';
 const STREET_SIGNAGE_URL = '/src/assets/images/osint_street_signage_1794763185376.jpg';
@@ -289,7 +296,8 @@ function syncActiveProjectInList(
     if (
       proj.nodes === nodes &&
       proj.edges === edges &&
-      proj.nodeCounter === nodeCounter
+      proj.nodeCounter === nodeCounter &&
+      !proj.isSummaryOnly
     ) {
       return proj;
     }
@@ -299,6 +307,9 @@ function syncActiveProjectInList(
       nodes,
       edges,
       nodeCounter,
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      isSummaryOnly: false,
     };
   });
   return changed ? updated : projects;
@@ -315,10 +326,22 @@ const debouncedProjectsSaver = createDebouncedTask(
   CANVAS_SAVE_DEBOUNCE_MS,
 );
 
+const debouncedServerProjectSaver = createDebouncedTask(
+  async (project: OsintProject) => {
+    try {
+      await saveProjectToServer(project);
+    } catch {
+      // Ignore offline/network errors; IndexedDB still holds a local copy
+    }
+  },
+  CANVAS_SAVE_DEBOUNCE_MS,
+);
+
 let suppressAutoSave = false;
 
 export function flushPendingCanvasSave(): void {
   debouncedProjectsSaver.flush();
+  debouncedServerProjectSaver.flush();
 }
 
 interface CanvasState {
@@ -349,6 +372,7 @@ interface CanvasState {
   deleteProject: (id: string) => void;
   renameProject: (id: string, newName: string) => void;
   loadProject: (id: string) => void;
+  fetchProjectsFromServer: () => Promise<void>;
   setModelConfig: (config: {
     provider: LlmProviderId;
     apiKey: string;
@@ -482,7 +506,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       nodes: [],
       edges: [],
       nodeCounter: 1,
+      nodeCount: 0,
+      edgeCount: 0,
+      isSummaryOnly: false,
     };
+
+    debouncedServerProjectSaver.flush();
 
     set((state) => {
       const syncedProjects = syncActiveProjectInList(
@@ -502,6 +531,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         suspectImageUrls: {},
         alertMessage: null,
       };
+    });
+
+    void saveProjectToServer(newProject).catch(() => {
+      // Non-blocking: IndexedDB still captures the state if server is unreachable
     });
 
     return newProject.id;
@@ -551,56 +584,310 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         alertMessage: null,
       };
     });
+
+    void deleteProjectOnServer(id).catch(() => {
+      // Non-blocking if project was never written to disk
+    });
   },
 
   renameProject: (id, newName) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
+
+    const existingBefore = get().projects.find((p) => p.id === id);
+
     set((state) => ({
       projects: state.projects.map((proj) =>
         proj.id === id ? { ...proj, name: trimmed } : proj,
       ),
     }));
+
+    if (existingBefore && !existingBefore.isSummaryOnly) {
+      const updated = get().projects.find((p) => p.id === id);
+      if (updated) {
+        void saveProjectToServer(updated).catch(() => {});
+      }
+    } else {
+      // Project was only loaded as a summary from /api/projects; fetch full JSON before saving the rename
+      void fetchProjectById(id)
+        .then((fullProject) => {
+          if (!fullProject) return;
+          const renamedProject: OsintProject = {
+            ...fullProject,
+            name: trimmed,
+            isSummaryOnly: false,
+          };
+          suppressAutoSave = true;
+          try {
+            set((state) => ({
+              projects: state.projects.map((p) =>
+                p.id === id ? renamedProject : p,
+              ),
+            }));
+          } finally {
+            suppressAutoSave = false;
+          }
+          return saveProjectToServer(renamedProject);
+        })
+        .catch(() => {});
+    }
   },
 
   loadProject: (id) => {
-    set((state) => {
-      const syncedProjects = syncActiveProjectInList(
-        state.projects,
-        state.currentProjectId,
-        state.nodes,
-        state.edges,
-        state.nodeCounter,
-      );
-      const target = syncedProjects.find((p) => p.id === id);
-      if (!target) {
-        return { projects: syncedProjects };
+    debouncedServerProjectSaver.flush();
+
+    suppressAutoSave = true;
+    try {
+      set((state) => {
+        const currentProj = state.projects.find(
+          (p) => p.id === state.currentProjectId,
+        );
+        const syncedProjects =
+          currentProj && !currentProj.isSummaryOnly
+            ? syncActiveProjectInList(
+                state.projects,
+                state.currentProjectId,
+                state.nodes,
+                state.edges,
+                state.nodeCounter,
+              )
+            : state.projects;
+        const target = syncedProjects.find((p) => p.id === id);
+        if (!target) {
+          return { projects: syncedProjects, currentProjectId: id };
+        }
+
+        const nextCounter =
+          target.nodeCounter ?? Math.max(target.nodes.length + 1, 1);
+
+        return {
+          projects: syncedProjects,
+          currentProjectId: target.id,
+          nodes: target.nodes,
+          edges: target.edges,
+          nodeCounter: nextCounter,
+          chatContextMap: computeChatContextMap(target.nodes, target.edges),
+          suspectImageUrls: extractSuspectUrlsFromNodes(target.nodes),
+          alertMessage: null,
+          analyzingChatIds: {},
+          generatingDorkIds: {},
+          extractingGeoIntelIds: {},
+          pivotingNodeIds: {},
+          generatingSuspectIds: {},
+        };
+      });
+    } finally {
+      suppressAutoSave = false;
+    }
+
+    // Load full project JSON from backend filesystem (/api/projects/:id)
+    void fetchProjectById(id)
+      .then((diskProject) => {
+        if (!diskProject) return;
+        suppressAutoSave = true;
+        try {
+          set((state) => {
+            const existsInList = state.projects.some(
+              (p) => p.id === diskProject.id,
+            );
+            const nextProjects = existsInList
+              ? state.projects.map((p) =>
+                  p.id === diskProject.id ? diskProject : p,
+                )
+              : [diskProject, ...state.projects];
+
+            if (state.currentProjectId !== diskProject.id) {
+              return { projects: nextProjects };
+            }
+
+            const nextCounter =
+              diskProject.nodeCounter ??
+              Math.max(diskProject.nodes.length + 1, 1);
+
+            return {
+              projects: nextProjects,
+              currentProjectId: diskProject.id,
+              nodes: diskProject.nodes,
+              edges: diskProject.edges,
+              nodeCounter: nextCounter,
+              chatContextMap: computeChatContextMap(
+                diskProject.nodes,
+                diskProject.edges,
+              ),
+              suspectImageUrls: extractSuspectUrlsFromNodes(diskProject.nodes),
+            };
+          });
+        } finally {
+          suppressAutoSave = false;
+        }
+      })
+      .catch(() => {
+        // Keep in-memory / IndexedDB project if server is unreachable
+      });
+  },
+
+  fetchProjectsFromServer: async () => {
+    try {
+      const summaries = await fetchProjectList();
+      suppressAutoSave = true;
+      try {
+        set((state) => {
+          const existingById = new Map(state.projects.map((p) => [p.id, p]));
+          const mergedProjects: OsintProject[] = summaries.map((summary) => {
+            const existing = existingById.get(summary.id);
+            if (existing && !existing.isSummaryOnly) {
+              return {
+                ...existing,
+                name: summary.name,
+                createdAt: summary.createdAt,
+                updatedAt: summary.updatedAt,
+                nodeCount: summary.nodeCount,
+                edgeCount: summary.edgeCount,
+              };
+            }
+            return {
+              id: summary.id,
+              name: summary.name,
+              createdAt: summary.createdAt,
+              updatedAt: summary.updatedAt,
+              nodes: [],
+              edges: [],
+              nodeCounter: Math.max(summary.nodeCount + 1, 1),
+              nodeCount: summary.nodeCount,
+              edgeCount: summary.edgeCount,
+              isSummaryOnly: true,
+            };
+          });
+
+          const nextCurrentId =
+            state.currentProjectId &&
+            mergedProjects.some((p) => p.id === state.currentProjectId)
+              ? state.currentProjectId
+              : mergedProjects[0]?.id ?? null;
+
+          return {
+            projects: mergedProjects,
+            currentProjectId: nextCurrentId,
+            isHydrated: true,
+            hasAttemptedHydration: true,
+          };
+        });
+      } finally {
+        suppressAutoSave = false;
       }
-
-      const nextCounter =
-        target.nodeCounter ?? Math.max(target.nodes.length + 1, 1);
-
-      return {
-        projects: syncedProjects,
-        currentProjectId: target.id,
-        nodes: target.nodes,
-        edges: target.edges,
-        nodeCounter: nextCounter,
-        chatContextMap: computeChatContextMap(target.nodes, target.edges),
-        suspectImageUrls: extractSuspectUrlsFromNodes(target.nodes),
-        alertMessage: null,
-        analyzingChatIds: {},
-        generatingDorkIds: {},
-        extractingGeoIntelIds: {},
-        pivotingNodeIds: {},
-        generatingSuspectIds: {},
-      };
-    });
+    } catch {
+      // Leave current in-memory / IndexedDB projects intact when server is unreachable
+    }
   },
 
   hydrateFromIndexedDb: async () => {
     if (get().hasAttemptedHydration) return;
     set({ hasAttemptedHydration: true });
+
+    try {
+      const serverSummaries = await fetchProjectList();
+      if (serverSummaries.length > 0) {
+        const mergedProjects: OsintProject[] = serverSummaries.map((s) => ({
+          id: s.id,
+          name: s.name,
+          createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
+          nodes: [],
+          edges: [],
+          nodeCounter: Math.max(s.nodeCount + 1, 1),
+          nodeCount: s.nodeCount,
+          edgeCount: s.edgeCount,
+          isSummaryOnly: true,
+        }));
+
+        const firstId = mergedProjects[0].id;
+        const firstFull = await fetchProjectById(firstId).catch(() => null);
+
+        suppressAutoSave = true;
+        try {
+          if (firstFull) {
+            const hydratedList = mergedProjects.map((p) =>
+              p.id === firstFull.id ? firstFull : p,
+            );
+            const nextCounter =
+              firstFull.nodeCounter ?? Math.max(firstFull.nodes.length + 1, 1);
+            set({
+              projects: hydratedList,
+              currentProjectId: firstFull.id,
+              nodes: firstFull.nodes,
+              edges: firstFull.edges,
+              nodeCounter: nextCounter,
+              chatContextMap: computeChatContextMap(
+                firstFull.nodes,
+                firstFull.edges,
+              ),
+              suspectImageUrls: extractSuspectUrlsFromNodes(firstFull.nodes),
+              isHydrated: true,
+            });
+          } else {
+            set({
+              projects: mergedProjects,
+              currentProjectId: firstId,
+              isHydrated: true,
+            });
+          }
+        } finally {
+          suppressAutoSave = false;
+        }
+        return;
+      }
+
+      // Server /data folder is currently empty — migrate any existing IndexedDB projects once
+      const saved = await loadProjectsFromIdb().catch(() => null);
+      suppressAutoSave = true;
+      try {
+        if (saved && saved.projects.length > 0) {
+          for (const proj of saved.projects) {
+            void saveProjectToServer(proj).catch(() => {});
+          }
+          const activeProject =
+            saved.projects.find((p) => p.id === saved.currentProjectId) ??
+            saved.projects[0];
+          const nextCounter =
+            activeProject.nodeCounter ??
+            Math.max(activeProject.nodes.length + 1, 1);
+          set({
+            projects: saved.projects.map((p) => ({
+              ...p,
+              nodeCount: p.nodes.length,
+              edgeCount: p.edges.length,
+              isSummaryOnly: false,
+            })),
+            currentProjectId: activeProject.id,
+            nodes: activeProject.nodes,
+            edges: activeProject.edges,
+            nodeCounter: nextCounter,
+            chatContextMap: computeChatContextMap(
+              activeProject.nodes,
+              activeProject.edges,
+            ),
+            suspectImageUrls: extractSuspectUrlsFromNodes(activeProject.nodes),
+            isHydrated: true,
+          });
+        } else {
+          set({
+            projects: [],
+            currentProjectId: null,
+            nodes: [],
+            edges: [],
+            nodeCounter: 1,
+            chatContextMap: {},
+            suspectImageUrls: {},
+            isHydrated: true,
+          });
+        }
+      } finally {
+        suppressAutoSave = false;
+      }
+      return;
+    } catch {
+      // Fallback to IndexedDB when backend /api/projects is unavailable
+    }
 
     try {
       const saved = await loadProjectsFromIdb();
@@ -1465,10 +1752,6 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const globalSettings = readGlobalSettings();
     const activeProvider = globalSettings.provider;
     const activeApiKey = getGlobalApiKey(activeProvider);
-    if (!activeApiKey) {
-      set({ alertMessage: MISSING_API_KEY_MESSAGE });
-      return false;
-    }
 
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt) {
@@ -1654,6 +1937,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       });
 
       const analysisText = await runMultiProviderAnalysis({
+        provider: activeProvider,
+        model: resolvedModel,
+        apiKey: activeApiKey || undefined,
         promptText: structuredPrompt,
         images: inlineImageParts,
       });
@@ -1736,6 +2022,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unexpected error calling Gemini API.';
+
+      if (isApiAuthError(error)) {
+        set({ alertMessage: errorMessage || MISSING_API_KEY_MESSAGE });
+        return false;
+      }
 
       set((state) => {
         const chatNode = state.nodes.find((n) => n.id === chatNodeId);
@@ -1830,10 +2121,6 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const globalSettings = readGlobalSettings();
     const activeApiKey = getGlobalApiKey(globalSettings.provider);
-    if (!activeApiKey) {
-      set({ alertMessage: MISSING_API_KEY_MESSAGE });
-      return { ok: false, error: MISSING_API_KEY_MESSAGE };
-    }
 
     const resolvedSource = resolveDorkSourceForNode(
       dorkNodeId,
@@ -1865,6 +2152,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const parsedDorks = await generateGoogleDorks({
         targetType: dorkNode.data.targetType,
         extractedSourceText: resolvedSource.combinedText,
+        provider: globalSettings.provider,
+        model: globalSettings.model,
+        apiKey: activeApiKey || undefined,
       });
 
       get().updateDorkNodeData(dorkNodeId, {
@@ -1878,6 +2168,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         error instanceof Error
           ? error.message
           : 'Failed to generate Google Dorks.';
+      if (isApiAuthError(error)) {
+        set({ alertMessage: message || MISSING_API_KEY_MESSAGE });
+      }
       return { ok: false, error: message };
     } finally {
       set((state) => ({
@@ -1899,10 +2192,6 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const globalSettings = readGlobalSettings();
     const activeProvider = globalSettings.provider;
     const activeApiKey = getGlobalApiKey(activeProvider);
-    if (!activeApiKey) {
-      set({ alertMessage: MISSING_API_KEY_MESSAGE });
-      return { ok: false, error: MISSING_API_KEY_MESSAGE };
-    }
 
     const connectedImage = getConnectedSourceImageForNode(
       geoIntelNodeId,
@@ -1942,6 +2231,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       }
 
       const rawOutput = await runMultiProviderAnalysis({
+        provider: activeProvider,
+        model: globalSettings.model,
+        apiKey: activeApiKey || undefined,
         systemPrompt: GEOINTEL_SYSTEM_PROMPT,
         promptText: buildGeoIntelUserPrompt(connectedImage.title),
         images: [inlinePart],
@@ -1963,6 +2255,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         error instanceof Error
           ? error.message
           : 'Failed to extract physical geolocation clues.';
+      if (isApiAuthError(error)) {
+        set({ alertMessage: message || MISSING_API_KEY_MESSAGE });
+      }
       return { ok: false, error: message };
     } finally {
       set((state) => ({
@@ -2158,10 +2453,6 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const globalSettings = readGlobalSettings();
     const activeProvider = globalSettings.provider;
     const activeApiKey = getGlobalApiKey(activeProvider);
-    if (!activeApiKey) {
-      set({ alertMessage: MISSING_API_KEY_MESSAGE });
-      return { ok: false, error: MISSING_API_KEY_MESSAGE };
-    }
 
     const resolvedContext = resolveSuspectContextForNode(
       suspectNodeId,
@@ -2198,6 +2489,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       });
 
       const { imageUrl, modelUsed } = await requestTargetImageGeneration({
+        provider: activeProvider,
+        apiKey: activeApiKey || undefined,
         prompt: compiledPrompt,
         images: inlineImages,
       });
@@ -2219,6 +2512,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         error instanceof Error
           ? error.message
           : 'Failed to generate target composite image.';
+      if (isApiAuthError(error)) {
+        set({ alertMessage: message || MISSING_API_KEY_MESSAGE });
+      }
       return { ok: false, error: message };
     } finally {
       set((state) => ({
@@ -2231,7 +2527,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 }));
 
-// Synchronize active project nodes/edges into state.projects and debounce IndexedDB saves of the entire projects array
+// Synchronize active project nodes/edges into state.projects and debounce IndexedDB + local filesystem saves
 useCanvasStore.subscribe((state, prevState) => {
   const graphChanged =
     state.nodes !== prevState.nodes ||
@@ -2267,6 +2563,15 @@ useCanvasStore.subscribe((state, prevState) => {
         currentProjectId: state.currentProjectId,
       }),
     );
+
+    if (graphChanged && state.currentProjectId) {
+      const activeProject = latestProjects.find(
+        (p) => p.id === state.currentProjectId,
+      );
+      if (activeProject && !activeProject.isSummaryOnly) {
+        debouncedServerProjectSaver.schedule(activeProject);
+      }
+    }
   }
 });
 

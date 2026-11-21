@@ -5,6 +5,8 @@ import {
   GLOBAL_API_KEY_STORAGE_KEY,
   GLOBAL_PROVIDER_STORAGE_KEY,
   GLOBAL_SETTINGS_STORAGE_KEY,
+  isApiAuthError,
+  MISSING_API_KEY_CODE,
   MISSING_API_KEY_MESSAGE,
   readGlobalSettings,
   saveGlobalSettings,
@@ -72,7 +74,7 @@ test('persists and reads global provider, API key, and model in localStorage', (
   mockStorage.clear();
 });
 
-test('AI utilities throw helpful Dashboard Settings error when no API key is set in localStorage', async () => {
+test('AI utilities allow server .env fallback when no key is set in localStorage and throw ApiAuthError on 401', async () => {
   const mockStorage = createMemoryStorage();
   Object.defineProperty(globalThis, 'localStorage', {
     value: mockStorage,
@@ -80,14 +82,32 @@ test('AI utilities throw helpful Dashboard Settings error when no API key is set
     writable: true,
   });
 
+  // 1. When backend returns 401 (neither request nor .env has a key), frontend throws ApiAuthError
+  const unauthorizedFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+    assert.equal('x-api-key' in headers, false);
+    assert.equal('apiKey' in body, false);
+    return new Response(
+      JSON.stringify({
+        error: MISSING_API_KEY_MESSAGE,
+        code: MISSING_API_KEY_CODE,
+      }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } },
+    );
+  }) as typeof fetch;
+
   await assert.rejects(
     () =>
       runMultiProviderAnalysis({
         promptText: 'Analyze harbor cranes.',
         images: [],
+        fetchImpl: unauthorizedFetch,
       }),
-    {
-      message: MISSING_API_KEY_MESSAGE,
+    (err: unknown) => {
+      assert.equal(isApiAuthError(err), true);
+      assert.equal((err as Error).message, MISSING_API_KEY_MESSAGE);
+      return true;
     },
   );
 
@@ -96,9 +116,12 @@ test('AI utilities throw helpful Dashboard Settings error when no API key is set
       generateGoogleDorks({
         targetType: 'General OSINT',
         extractedSourceText: 'alice@acme.io',
+        fetchImpl: unauthorizedFetch,
       }),
-    {
-      message: MISSING_API_KEY_MESSAGE,
+    (err: unknown) => {
+      assert.equal(isApiAuthError(err), true);
+      assert.equal((err as Error).message, MISSING_API_KEY_MESSAGE);
+      return true;
     },
   );
 
@@ -106,14 +129,31 @@ test('AI utilities throw helpful Dashboard Settings error when no API key is set
     () =>
       requestTargetImageGeneration({
         prompt: 'Suspect composite description',
+        fetchImpl: unauthorizedFetch,
       }),
-    {
-      message: MISSING_API_KEY_MESSAGE,
+    (err: unknown) => {
+      assert.equal(isApiAuthError(err), true);
+      assert.equal((err as Error).message, MISSING_API_KEY_MESSAGE);
+      return true;
     },
   );
+
+  // 2. When backend has .env fallback configured and returns 200, request succeeds with no localStorage key
+  const envFallbackFetch = (async () =>
+    new Response(JSON.stringify({ text: 'Verified via server .env key' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch;
+
+  const fallbackText = await runMultiProviderAnalysis({
+    promptText: 'Analyze harbor cranes.',
+    images: [],
+    fetchImpl: envFallbackFetch,
+  });
+  assert.equal(fallbackText, 'Verified via server .env key');
 });
 
-test('AI utilities pull API key and provider from localStorage globally when configured', async () => {
+test('AI utilities pass global API key in both x-api-key header and JSON body', async () => {
   const mockStorage = createMemoryStorage();
   Object.defineProperty(globalThis, 'localStorage', {
     value: mockStorage,
@@ -128,7 +168,9 @@ test('AI utilities pull API key and provider from localStorage globally when con
   });
 
   let capturedLlmBody: Record<string, unknown> | null = null;
+  let capturedLlmHeaders: Record<string, string> | null = null;
   const mockLlmFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    capturedLlmHeaders = (init?.headers ?? {}) as Record<string, string>;
     capturedLlmBody = JSON.parse(String(init?.body ?? '{}')) as Record<
       string,
       unknown
@@ -152,6 +194,7 @@ test('AI utilities pull API key and provider from localStorage globally when con
   assert.equal(capturedLlmBody?.provider, 'anthropic');
   assert.equal(capturedLlmBody?.apiKey, 'sk-ant-dashboard-key');
   assert.equal(capturedLlmBody?.model, 'claude-3-5-sonnet-latest');
+  assert.equal(capturedLlmHeaders?.['x-api-key'], 'sk-ant-dashboard-key');
 
   saveGlobalSettings({
     provider: 'openai',
@@ -160,10 +203,12 @@ test('AI utilities pull API key and provider from localStorage globally when con
   });
 
   let capturedImageBody: Record<string, unknown> | null = null;
+  let capturedImageHeaders: Record<string, string> | null = null;
   const mockImageFetch = (async (
     _url: string | URL | Request,
     init?: RequestInit,
   ) => {
+    capturedImageHeaders = (init?.headers ?? {}) as Record<string, string>;
     capturedImageBody = JSON.parse(String(init?.body ?? '{}')) as Record<
       string,
       unknown
@@ -187,6 +232,7 @@ test('AI utilities pull API key and provider from localStorage globally when con
   assert.ok(capturedImageBody);
   assert.equal(capturedImageBody?.provider, 'openai');
   assert.equal(capturedImageBody?.apiKey, 'sk-openai-dashboard-key');
+  assert.equal(capturedImageHeaders?.['x-api-key'], 'sk-openai-dashboard-key');
 
   mockStorage.clear();
 });

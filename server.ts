@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,11 +84,29 @@ const PROVIDER_ENV_KEYS: Record<LlmProviderId, string> = {
   mistral: 'MISTRAL_API_KEY',
 };
 
+const MISSING_API_KEY_MESSAGE =
+  'Please set your API key in the Dashboard Settings.';
+const MISSING_API_KEY_CODE = 'MISSING_API_KEY';
+
 const PLACEHOLDER_ENV_VALUES = new Set([
   'MY_GEMINI_API_KEY',
   'YOUR_ACTUAL_KEY_HERE',
   'YOUR_GEMINI_API_KEY_HERE',
 ]);
+
+class MissingApiKeyError extends Error {
+  readonly status = 401;
+  readonly code = MISSING_API_KEY_CODE;
+  readonly providerName: string;
+  readonly envVarName: string;
+
+  constructor(providerName: string, envVarName: string) {
+    super(MISSING_API_KEY_MESSAGE);
+    this.name = 'MissingApiKeyError';
+    this.providerName = providerName;
+    this.envVarName = envVarName;
+  }
+}
 
 function readServerEnvKey(envVarName: string): string {
   const raw = process.env[envVarName];
@@ -96,15 +116,44 @@ function readServerEnvKey(envVarName: string): string {
   return trimmed;
 }
 
+function sanitizeClientApiKey(candidate: unknown): string {
+  if (typeof candidate !== 'string') return '';
+  const trimmed = candidate.trim();
+  if (!trimmed || PLACEHOLDER_ENV_VALUES.has(trimmed)) return '';
+  return trimmed;
+}
+
+/**
+ * Extracts a client-supplied API key from the JSON body or request headers
+ * (`x-api-key` or `Authorization: Bearer <key>`).
+ */
+function extractRequestApiKey(
+  req: Request,
+  bodyApiKey?: unknown,
+): string | undefined {
+  const fromBody = sanitizeClientApiKey(bodyApiKey);
+  if (fromBody) return fromBody;
+
+  const fromXApiKey = sanitizeClientApiKey(req.header('x-api-key'));
+  if (fromXApiKey) return fromXApiKey;
+
+  const authHeader = req.header('authorization');
+  if (typeof authHeader === 'string' && authHeader.trim()) {
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+    const fromAuth = sanitizeClientApiKey(bearerMatch ? bearerMatch[1] : authHeader);
+    if (fromAuth) return fromAuth;
+  }
+
+  return undefined;
+}
+
 function resolveEffectiveApiKey(
   clientApiKey: string | undefined,
   envVarName: string,
 ): string {
-  if (typeof clientApiKey === 'string') {
-    const trimmed = clientApiKey.trim();
-    if (trimmed && !PLACEHOLDER_ENV_VALUES.has(trimmed)) {
-      return trimmed;
-    }
+  const fromClient = sanitizeClientApiKey(clientApiKey);
+  if (fromClient) {
+    return fromClient;
   }
   return readServerEnvKey(envVarName);
 }
@@ -112,7 +161,7 @@ function resolveEffectiveApiKey(
 function getGeminiClient(clientApiKey?: string): GoogleGenAI {
   const apiKey = resolveEffectiveApiKey(clientApiKey, 'GEMINI_API_KEY');
   if (!apiKey) {
-    throw new Error('Please set your API key in the Dashboard Settings.');
+    throw new MissingApiKeyError('Google', 'GEMINI_API_KEY');
   }
   return new GoogleGenAI({
     apiKey,
@@ -158,16 +207,26 @@ function formatServerProviderError(
 ): {
   status: number;
   message: string;
+  code?: string;
 } {
+  if (error instanceof MissingApiKeyError) {
+    return {
+      status: 401,
+      code: MISSING_API_KEY_CODE,
+      message: MISSING_API_KEY_MESSAGE,
+    };
+  }
+
   const rawMessage =
     error instanceof Error
       ? error.message
       : `${providerName} API request failed on the server.`;
 
-  if (rawMessage.includes('Please set your API key in the Dashboard Settings.')) {
+  if (rawMessage.includes(MISSING_API_KEY_MESSAGE)) {
     return {
-      status: 403,
-      message: rawMessage,
+      status: 401,
+      code: MISSING_API_KEY_CODE,
+      message: MISSING_API_KEY_MESSAGE,
     };
   }
 
@@ -180,7 +239,8 @@ function formatServerProviderError(
     rawMessage.includes('Incorrect API key')
   ) {
     return {
-      status: 403,
+      status: 401,
+      code: 'INVALID_API_KEY',
       message: `${rawMessage} Please check your ${providerName} API key in Dashboard Settings (or ${envVarName} on the server).`,
     };
   }
@@ -229,7 +289,7 @@ async function executeProviderGeneration(params: {
 
   const effectiveApiKey = resolveEffectiveApiKey(apiKey, envVarName);
   if (!effectiveApiKey) {
-    throw new Error('Please set your API key in the Dashboard Settings.');
+    throw new MissingApiKeyError(meta.name, envVarName);
   }
 
   if (provider === 'anthropic') {
@@ -366,7 +426,7 @@ export async function startServer() {
   });
 
   // Unified server-side proxy route for all LLM providers (Gemini, Anthropic, OpenAI, OpenRouter, DeepSeek, Mistral)
-  app.post('/api/llm/generate', async (req: Request, res: Response) => {
+  const handleLlmGenerate = async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as LlmGenerateBody;
     const promptText =
       typeof body.promptText === 'string' ? body.promptText.trim() : '';
@@ -389,11 +449,12 @@ export async function startServer() {
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const images = sanitizeInlineImages(body.images);
+    const requestApiKey = extractRequestApiKey(req, body.apiKey);
 
     try {
       const text = await executeProviderGeneration({
         provider: providerId,
-        apiKey: typeof body.apiKey === 'string' ? body.apiKey : undefined,
+        apiKey: requestApiKey,
         model: resolvedModel,
         promptText,
         images,
@@ -406,9 +467,15 @@ export async function startServer() {
         meta.envVarName,
         error,
       );
-      res.status(formatted.status).json({ error: formatted.message });
+      res.status(formatted.status).json({
+        error: formatted.message,
+        ...(formatted.code ? { code: formatted.code } : {}),
+      });
     }
-  });
+  };
+
+  app.post('/api/llm/generate', handleLlmGenerate);
+  app.post('/api/llm/complete', handleLlmGenerate);
 
   // Dedicated Gemini generation endpoint
   app.post('/api/gemini/generate', async (req: Request, res: Response) => {
@@ -428,11 +495,12 @@ export async function startServer() {
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const images = sanitizeInlineImages(body.images);
+    const requestApiKey = extractRequestApiKey(req, body.apiKey);
 
     try {
       const text = await executeProviderGeneration({
         provider: 'google',
-        apiKey: typeof body.apiKey === 'string' ? body.apiKey : undefined,
+        apiKey: requestApiKey,
         model: resolvedModel,
         promptText,
         images,
@@ -445,7 +513,10 @@ export async function startServer() {
         'GEMINI_API_KEY',
         error,
       );
-      res.status(formatted.status).json({ error: formatted.message });
+      res.status(formatted.status).json({
+        error: formatted.message,
+        ...(formatted.code ? { code: formatted.code } : {}),
+      });
     }
   });
 
@@ -466,15 +537,29 @@ export async function startServer() {
         : 'gemini-4-hydrogen';
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
+    const requestApiKey = extractRequestApiKey(req, body.apiKey);
+
+    let ai: GoogleGenAI;
+    try {
+      ai = getGeminiClient(requestApiKey);
+    } catch (error) {
+      const formatted = formatServerProviderError(
+        'Google',
+        'GEMINI_API_KEY',
+        error,
+      );
+      res.status(formatted.status).json({
+        error: formatted.message,
+        ...(formatted.code ? { code: formatted.code } : {}),
+      });
+      return;
+    }
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
     try {
-      const ai = getGeminiClient(
-        typeof body.apiKey === 'string' ? body.apiKey : undefined,
-      );
       const parts = buildGeminiParts(promptText, body.images);
 
       const streamResponse = await ai.models.generateContentStream({
@@ -738,12 +823,14 @@ export async function startServer() {
         ? body.provider
         : 'google';
     const inlineImages = sanitizeInlineImages(body.images);
+    const requestApiKey = extractRequestApiKey(req, body.apiKey);
 
     if (providerId === 'openai') {
-      const openAiKey = resolveEffectiveApiKey(body.apiKey, 'OPENAI_API_KEY');
+      const openAiKey = resolveEffectiveApiKey(requestApiKey, 'OPENAI_API_KEY');
       if (!openAiKey) {
-        res.status(403).json({
-          error: 'Please set your API key in the Dashboard Settings.',
+        res.status(401).json({
+          error: MISSING_API_KEY_MESSAGE,
+          code: MISSING_API_KEY_CODE,
         });
         return;
       }
@@ -779,7 +866,10 @@ export async function startServer() {
           'OPENAI_API_KEY',
           error,
         );
-        res.status(formatted.status).json({ error: formatted.message });
+        res.status(formatted.status).json({
+          error: formatted.message,
+          ...(formatted.code ? { code: formatted.code } : {}),
+        });
       }
       return;
     }
@@ -793,9 +883,7 @@ export async function startServer() {
 
     // Provider is Google: Call Imagen API (imagen-3.0-generate-001)
     try {
-      const ai = getGeminiClient(
-        typeof body.apiKey === 'string' ? body.apiKey : undefined,
-      );
+      const ai = getGeminiClient(requestApiKey);
       let finalPrompt = rawPrompt;
 
       // If connected ImageNodes were passed, optionally extract brief visual traits to enrich the Imagen prompt
@@ -847,7 +935,231 @@ export async function startServer() {
         'GEMINI_API_KEY',
         error,
       );
-      res.status(formatted.status).json({ error: formatted.message });
+      res.status(formatted.status).json({
+        error: formatted.message,
+        ...(formatted.code ? { code: formatted.code } : {}),
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Local Filesystem Project Persistence (/data/<project_id>.json)
+  // ---------------------------------------------------------------------------
+  const serverDir = path.dirname(fileURLToPath(import.meta.url));
+  const dataDir = process.env.TRACE_DATA_DIR?.trim()
+    ? path.resolve(process.env.TRACE_DATA_DIR.trim())
+    : path.resolve(serverDir, 'data');
+
+  fs.mkdirSync(dataDir, { recursive: true });
+
+  const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+  function resolveSafeProjectFilePath(projectId: string): string | null {
+    if (!PROJECT_ID_RE.test(projectId) || projectId.includes('..')) {
+      return null;
+    }
+    const candidate = path.resolve(dataDir, `${projectId}.json`);
+    if (!candidate.startsWith(dataDir + path.sep)) {
+      return null;
+    }
+    return candidate;
+  }
+
+  // Save a project JSON payload to /data/<project_id>.json
+  app.post('/api/projects/save', async (req: Request, res: Response) => {
+    const rawBody = (req.body ?? {}) as Record<string, unknown>;
+    const payload =
+      rawBody.project && typeof rawBody.project === 'object'
+        ? (rawBody.project as Record<string, unknown>)
+        : rawBody;
+
+    const projectId =
+      typeof payload.id === 'string' ? payload.id.trim() : '';
+    const filePath = resolveSafeProjectFilePath(projectId);
+    if (!filePath) {
+      res.status(400).json({
+        error:
+          'A valid project "id" is required (alphanumeric, ".", "_", "-", max 128 chars).',
+      });
+      return;
+    }
+
+    const name =
+      typeof payload.name === 'string' && payload.name.trim()
+        ? payload.name.trim()
+        : 'Untitled Project';
+    const createdAt =
+      typeof payload.createdAt === 'string' && payload.createdAt.trim()
+        ? payload.createdAt.trim()
+        : new Date().toISOString();
+    const updatedAt = new Date().toISOString();
+    const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+    const edges = Array.isArray(payload.edges) ? payload.edges : [];
+    const nodeCounter =
+      typeof payload.nodeCounter === 'number' &&
+      Number.isFinite(payload.nodeCounter) &&
+      payload.nodeCounter >= 1
+        ? payload.nodeCounter
+        : Math.max(nodes.length + 1, 1);
+
+    const projectRecord = {
+      id: projectId,
+      name,
+      createdAt,
+      updatedAt,
+      nodes,
+      edges,
+      nodeCounter,
+    };
+
+    try {
+      await fsp.mkdir(dataDir, { recursive: true });
+      const tmpPath = `${filePath}.${crypto.randomUUID()}.tmp`;
+      await fsp.writeFile(
+        tmpPath,
+        JSON.stringify(projectRecord, null, 2),
+        'utf8',
+      );
+      await fsp.rename(tmpPath, filePath);
+
+      res.json({
+        ok: true,
+        id: projectId,
+        name,
+        createdAt,
+        updatedAt,
+        nodeCount: nodes.length,
+        edgeCount: edges.length,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Failed to save project file on server.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // List all saved project JSON files in /data (IDs, names, and metadata)
+  app.get('/api/projects', async (_req: Request, res: Response) => {
+    try {
+      await fsp.mkdir(dataDir, { recursive: true });
+      const entries = await fsp.readdir(dataDir, { withFileTypes: true });
+      const jsonFiles = entries.filter(
+        (entry) => entry.isFile() && entry.name.endsWith('.json'),
+      );
+
+      const summaries: Array<{
+        id: string;
+        name: string;
+        createdAt: string;
+        updatedAt: string;
+        nodeCount: number;
+        edgeCount: number;
+      }> = [];
+
+      for (const file of jsonFiles) {
+        const filePath = path.join(dataDir, file.name);
+        try {
+          const raw = await fsp.readFile(filePath, 'utf8');
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          const fallbackId = file.name.slice(0, -'.json'.length);
+          const id =
+            typeof parsed.id === 'string' && parsed.id.trim()
+              ? parsed.id.trim()
+              : fallbackId;
+          const name =
+            typeof parsed.name === 'string' && parsed.name.trim()
+              ? parsed.name.trim()
+              : 'Untitled Project';
+          const stat = await fsp.stat(filePath);
+          const createdAt =
+            typeof parsed.createdAt === 'string' && parsed.createdAt.trim()
+              ? parsed.createdAt.trim()
+              : stat.birthtime.toISOString();
+          const updatedAt =
+            typeof parsed.updatedAt === 'string' && parsed.updatedAt.trim()
+              ? parsed.updatedAt.trim()
+              : stat.mtime.toISOString();
+          const nodeCount = Array.isArray(parsed.nodes) ? parsed.nodes.length : 0;
+          const edgeCount = Array.isArray(parsed.edges) ? parsed.edges.length : 0;
+
+          summaries.push({
+            id,
+            name,
+            createdAt,
+            updatedAt,
+            nodeCount,
+            edgeCount,
+          });
+        } catch {
+          // Skip malformed or transient JSON files
+        }
+      }
+
+      summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      res.json({ projects: summaries });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Failed to list saved projects.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Load a specific project JSON from /data/<id>.json
+  app.get('/api/projects/:id', async (req: Request, res: Response) => {
+    const projectId =
+      typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    const filePath = resolveSafeProjectFilePath(projectId);
+    if (!filePath) {
+      res.status(400).json({ error: 'Invalid project ID.' });
+      return;
+    }
+
+    try {
+      const raw = await fsp.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      res.json(parsed);
+    } catch (error) {
+      const errCode = (error as NodeJS.ErrnoException | null)?.code;
+      if (errCode === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found.' });
+        return;
+      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Failed to read project file.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Delete a saved project JSON from /data/<id>.json
+  app.delete('/api/projects/:id', async (req: Request, res: Response) => {
+    const projectId =
+      typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    const filePath = resolveSafeProjectFilePath(projectId);
+    if (!filePath) {
+      res.status(400).json({ error: 'Invalid project ID.' });
+      return;
+    }
+
+    try {
+      await fsp.unlink(filePath);
+      res.json({ ok: true, id: projectId });
+    } catch (error) {
+      const errCode = (error as NodeJS.ErrnoException | null)?.code;
+      if (errCode === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found.' });
+        return;
+      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Failed to delete project file.';
+      res.status(500).json({ error: message });
     }
   });
 
@@ -934,9 +1246,8 @@ export async function startServer() {
     ws.on('error', (err) => console.error('[ws] error:', err.message));
   });
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const distPath = path.resolve(__dirname, 'dist');
-  const mobileDistPath = path.resolve(__dirname, 'mobile', 'dist');
+  const distPath = path.resolve(serverDir, 'dist');
+  const mobileDistPath = path.resolve(serverDir, 'mobile', 'dist');
 
   // Serve the built Mobile Companion App at /mobile
   app.use('/mobile', express.static(mobileDistPath));
@@ -985,6 +1296,7 @@ export async function startServer() {
     console.log(`Mobile Companion App available at http://${host}:${port}/mobile`);
     console.log(`WebSocket sync endpoint: ws://${host}:${port}/sync`);
     console.log(`🔒 WebSocket PIN: ${wsPin}`);
+    console.log(`Projects data directory: ${dataDir}`);
     console.log(`CORS origins: ${allowedOrigins.join(', ')}`);
     console.log(
       `OSINT pivot engine: native fetch (${OSINT_PLATFORMS.length} platforms, ${osintTimeoutMs}ms timeout)`,

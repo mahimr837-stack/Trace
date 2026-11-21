@@ -110,6 +110,99 @@ check(
   `HTTP ${archiveLive[0]}, snapshots=${archiveLive[1]?.snapshots?.length ?? 0}`,
 );
 
+// 3d. AI endpoints return clean 401 when neither request nor .env provides a key
+const llmNoKey = await fetch(`${BASE}/api/llm/complete`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ provider: 'anthropic', promptText: 'Ping' }),
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'POST /api/llm/complete returns 401 when no key configured',
+  llmNoKey[0] === 401 && llmNoKey[1]?.code === 'MISSING_API_KEY',
+  `HTTP ${llmNoKey[0]}, code=${llmNoKey[1]?.code}`,
+);
+
+const imageNoKey = await fetch(`${BASE}/api/image/generate`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ provider: 'openai', prompt: 'Composite test' }),
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'POST /api/image/generate returns 401 when no key configured',
+  imageNoKey[0] === 401 && imageNoKey[1]?.code === 'MISSING_API_KEY',
+  `HTTP ${imageNoKey[0]}, code=${imageNoKey[1]?.code}`,
+);
+
+// 3e. Local Filesystem Project Persistence (/api/projects/save, /api/projects, /api/projects/:id, DELETE)
+const smokeProjId = `smoke-proj-${Date.now()}`;
+const saveProj = await fetch(`${BASE}/api/projects/save`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    id: smokeProjId,
+    name: 'Smoke Test Case',
+    createdAt: '2026-11-21T12:00:00.000Z',
+    nodeCounter: 2,
+    nodes: [
+      {
+        id: 'img-1',
+        type: 'imageNode',
+        position: { x: 40, y: 80 },
+        data: { kind: 'image', title: 'Smoke Evidence', imageUrl: null },
+      },
+    ],
+    edges: [],
+  }),
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'POST /api/projects/save persists project JSON to /data',
+  saveProj[0] === 200 && saveProj[1]?.ok === true && saveProj[1]?.id === smokeProjId,
+  `HTTP ${saveProj[0]}, id=${saveProj[1]?.id}`,
+);
+
+const listProj = await fetch(`${BASE}/api/projects`).then(async (r) => [
+  r.status,
+  await r.json(),
+]);
+check(
+  'GET /api/projects lists saved project',
+  listProj[0] === 200 &&
+    Array.isArray(listProj[1]?.projects) &&
+    listProj[1].projects.some(
+      (p) => p.id === smokeProjId && p.name === 'Smoke Test Case' && p.nodeCount === 1,
+    ),
+  `HTTP ${listProj[0]}, count=${listProj[1]?.projects?.length ?? 0}`,
+);
+
+const loadProj = await fetch(`${BASE}/api/projects/${smokeProjId}`).then(async (r) => [
+  r.status,
+  await r.json(),
+]);
+check(
+  'GET /api/projects/:id loads saved project JSON',
+  loadProj[0] === 200 &&
+    loadProj[1]?.id === smokeProjId &&
+    Array.isArray(loadProj[1]?.nodes) &&
+    loadProj[1].nodes.length === 1,
+  `HTTP ${loadProj[0]}, nodes=${loadProj[1]?.nodes?.length ?? 0}`,
+);
+
+const traversalProj = await fetch(`${BASE}/api/projects/..%2Fpackage.json`);
+check(
+  'GET /api/projects/:id blocks path traversal',
+  traversalProj.status === 400,
+  `HTTP ${traversalProj.status}`,
+);
+
+const delProj = await fetch(`${BASE}/api/projects/${smokeProjId}`, {
+  method: 'DELETE',
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'DELETE /api/projects/:id cleans up saved project',
+  delProj[0] === 200 && delProj[1]?.ok === true,
+  `HTTP ${delProj[0]}`,
+);
+
 // 4. WebSocket PIN Authentication (GET /api/sync/pin, 4001 on wrong/missing PIN, relay when authenticated)
 const pinRes = await fetch(`${BASE}/api/sync/pin`).then(async (r) => [r.status, await r.json()]);
 const validPin = typeof pinRes[1]?.pin === 'string' ? pinRes[1].pin : '';
