@@ -201,6 +201,38 @@ export async function saveProjectToServer(
 }
 
 /**
+ * Unload-safe save to `/api/projects/save` for `beforeunload` / `pagehide` handlers.
+ * Uses `navigator.sendBeacon` (survives tab navigation and handles large payloads)
+ * and falls back to `fetch(..., { keepalive: true })`.
+ */
+export function saveProjectToServerOnUnload(project: OsintProject): boolean {
+  try {
+    const payload = JSON.stringify(buildProjectSavePayload(project));
+    if (
+      typeof navigator !== 'undefined' &&
+      typeof navigator.sendBeacon === 'function'
+    ) {
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon(PROJECTS_SAVE_ENDPOINT, blob)) {
+        return true;
+      }
+    }
+    if (typeof fetch === 'function') {
+      void fetch(PROJECTS_SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+      return true;
+    }
+  } catch {
+    // Ignore unload transport failures
+  }
+  return false;
+}
+
+/**
  * Deletes a saved project JSON file via `DELETE /api/projects/:id`.
  */
 export async function deleteProjectOnServer(

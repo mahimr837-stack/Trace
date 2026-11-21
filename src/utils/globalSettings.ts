@@ -1,6 +1,7 @@
 import {
   getProviderMeta,
   LLM_PROVIDERS,
+  normalizeProviderModel,
   type LlmProviderId,
 } from './llmProviders';
 
@@ -134,10 +135,10 @@ export function readGlobalSettings(): GlobalSettingsState {
               providerConfigs[p.id] = {
                 apiKey:
                   typeof entry.apiKey === 'string' ? entry.apiKey.trim() : '',
-                model:
-                  typeof entry.model === 'string' && entry.model.trim()
-                    ? entry.model.trim()
-                    : p.defaultModel,
+                model: normalizeProviderModel(
+                  p.id,
+                  typeof entry.model === 'string' ? entry.model : p.defaultModel,
+                ),
               };
             }
           }
@@ -147,11 +148,13 @@ export function readGlobalSettings(): GlobalSettingsState {
           typeof parsed.apiKey === 'string'
             ? parsed.apiKey.trim()
             : providerConfigs[activeProvider]?.apiKey ?? '';
-        activeModel =
+        activeModel = normalizeProviderModel(
+          activeProvider,
           typeof parsed.model === 'string' && parsed.model.trim()
             ? parsed.model.trim()
             : providerConfigs[activeProvider]?.model ||
-              currentMeta.defaultModel;
+              currentMeta.defaultModel,
+        );
 
         providerConfigs[activeProvider] = {
           apiKey: activeApiKey,
@@ -175,7 +178,7 @@ export function readGlobalSettings(): GlobalSettingsState {
     }
     const directModel = storage.getItem(GLOBAL_MODEL_STORAGE_KEY);
     if (typeof directModel === 'string' && directModel.trim() && !rawJson) {
-      activeModel = directModel.trim();
+      activeModel = normalizeProviderModel(activeProvider, directModel);
       providerConfigs[activeProvider] = {
         ...providerConfigs[activeProvider],
         model: activeModel,

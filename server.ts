@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
@@ -16,6 +17,7 @@ import {
   extractOpenAiResponseText,
   getProviderMeta,
   LLM_PROVIDERS,
+  normalizeProviderModel,
   readApiErrorMessage,
   type LlmProviderId,
 } from './src/utils/llmProviders';
@@ -38,6 +40,21 @@ import {
   extractOpenAiDalleImageUrl,
   IMAGEN_MODEL_ID,
 } from './src/utils/suspectComposite';
+
+// Prefer IPv4 DNS resolution so outbound fetch calls (Gemini, Wayback, OSINT) never stall on broken IPv6 routes.
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // Ignore on runtimes that do not support setDefaultResultOrder
+}
+
+const AI_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const IMAGEN_FALLBACK_MODELS = [
+  IMAGEN_MODEL_ID,
+  'imagen-3.0-generate-002',
+  'imagen-4.0-generate-001',
+] as const;
 
 interface InlineImageInput {
   mimeType: string;
@@ -108,6 +125,104 @@ class MissingApiKeyError extends Error {
   }
 }
 
+class UpstreamTimeoutError extends Error {
+  readonly status = 504;
+  readonly code = 'UPSTREAM_TIMEOUT';
+
+  constructor(label: string, timeoutMs: number) {
+    super(`${label} request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    this.name = 'UpstreamTimeoutError';
+  }
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  label: string,
+): Promise<globalThis.Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new UpstreamTimeoutError(label, timeoutMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runWithAbortTimeout<T>(
+  task: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new UpstreamTimeoutError(label, timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([task(controller.signal), timeoutPromise]);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new UpstreamTimeoutError(label, timeoutMs);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function describeErrorCause(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    return code ? `${cause.message} (${code})` : cause.message;
+  }
+  return error.message;
+}
+
+function extractReadableErrorMessage(rawMessage: string): string {
+  const trimmed = rawMessage.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { message?: unknown; status?: unknown } | string;
+        message?: unknown;
+      };
+      if (
+        parsed?.error &&
+        typeof parsed.error === 'object' &&
+        typeof parsed.error.message === 'string' &&
+        parsed.error.message.trim()
+      ) {
+        return parsed.error.message.trim();
+      }
+      if (typeof parsed?.error === 'string' && parsed.error.trim()) {
+        return parsed.error.trim();
+      }
+      if (typeof parsed?.message === 'string' && parsed.message.trim()) {
+        return parsed.message.trim();
+      }
+    } catch {
+      // Keep rawMessage when not valid JSON
+    }
+  }
+  return trimmed;
+}
+
 function readServerEnvKey(envVarName: string): string {
   const raw = process.env[envVarName];
   if (!raw || typeof raw !== 'string') return '';
@@ -158,19 +273,21 @@ function resolveEffectiveApiKey(
   return readServerEnvKey(envVarName);
 }
 
+function getKeySourceLabel(
+  requestApiKey: string | undefined,
+  envVarName: string,
+): 'request' | 'env' | 'none' {
+  if (sanitizeClientApiKey(requestApiKey)) return 'request';
+  if (readServerEnvKey(envVarName)) return 'env';
+  return 'none';
+}
+
 function getGeminiClient(clientApiKey?: string): GoogleGenAI {
   const apiKey = resolveEffectiveApiKey(clientApiKey, 'GEMINI_API_KEY');
   if (!apiKey) {
     throw new MissingApiKeyError('Google', 'GEMINI_API_KEY');
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  return new GoogleGenAI({ apiKey });
 }
 
 function sanitizeInlineImages(images?: InlineImageInput[]): InlineImageInput[] {
@@ -217,10 +334,19 @@ function formatServerProviderError(
     };
   }
 
+  if (error instanceof UpstreamTimeoutError) {
+    return {
+      status: 504,
+      code: 'UPSTREAM_TIMEOUT',
+      message: error.message,
+    };
+  }
+
   const rawMessage =
     error instanceof Error
       ? error.message
       : `${providerName} API request failed on the server.`;
+  const readable = extractReadableErrorMessage(rawMessage);
 
   if (rawMessage.includes(MISSING_API_KEY_MESSAGE)) {
     return {
@@ -231,7 +357,19 @@ function formatServerProviderError(
   }
 
   if (
+    (error instanceof Error && error.name === 'AbortError') ||
+    /timed out/i.test(rawMessage)
+  ) {
+    return {
+      status: 504,
+      code: 'UPSTREAM_TIMEOUT',
+      message: `${providerName} request timed out after 30 seconds.`,
+    };
+  }
+
+  if (
     rawMessage.includes('API_KEY_INVALID') ||
+    rawMessage.includes('API key not valid') ||
     rawMessage.includes('PERMISSION_DENIED') ||
     rawMessage.includes('is not configured on the server') ||
     rawMessage.includes('401') ||
@@ -241,20 +379,42 @@ function formatServerProviderError(
     return {
       status: 401,
       code: 'INVALID_API_KEY',
-      message: `${rawMessage} Please check your ${providerName} API key in Dashboard Settings (or ${envVarName} on the server).`,
+      message: `${readable} Please check your ${providerName} API key in Dashboard Settings (or ${envVarName} on the server).`,
+    };
+  }
+
+  if (rawMessage.includes('NOT_FOUND') || rawMessage.includes('is not found')) {
+    return {
+      status: 404,
+      code: 'MODEL_NOT_FOUND',
+      message: `${readable} Try selecting a supported model (e.g., ${DEFAULT_GEMINI_MODEL}) in Dashboard Settings.`,
     };
   }
 
   if (rawMessage.includes('RESOURCE_EXHAUSTED') || rawMessage.includes('429')) {
     return {
       status: 429,
-      message: `${rawMessage} Check quota or billing for ${providerName} (${envVarName}).`,
+      message: `${readable} Check quota or billing for ${providerName} (${envVarName}).`,
+    };
+  }
+
+  if (rawMessage.includes('INVALID_ARGUMENT') || rawMessage.includes('400')) {
+    return {
+      status: 400,
+      message: readable,
+    };
+  }
+
+  if (rawMessage === 'fetch failed') {
+    return {
+      status: 502,
+      message: `Failed to reach ${providerName} API (${describeErrorCause(error)}).`,
     };
   }
 
   return {
     status: 500,
-    message: rawMessage,
+    message: readable,
   };
 }
 
@@ -269,18 +429,26 @@ async function executeProviderGeneration(params: {
   const { provider, apiKey, model, promptText, images, systemPrompt } = params;
   const meta = getProviderMeta(provider);
   const envVarName = PROVIDER_ENV_KEYS[provider] ?? meta.envVarName;
-  const resolvedModel = model.trim() || meta.defaultModel;
+  const resolvedModel = normalizeProviderModel(provider, model);
 
   if (provider === 'google') {
     const ai = getGeminiClient(apiKey);
     const parts = buildGeminiParts(promptText, images);
-    const response: GenerateContentResponse = await ai.models.generateContent({
-      model: resolvedModel,
-      contents: { parts },
-      ...(systemPrompt?.trim()
-        ? { config: { systemInstruction: systemPrompt.trim() } }
-        : {}),
-    });
+    const response: GenerateContentResponse = await runWithAbortTimeout(
+      (abortSignal) =>
+        ai.models.generateContent({
+          model: resolvedModel,
+          contents: { parts },
+          config: {
+            abortSignal,
+            ...(systemPrompt?.trim()
+              ? { systemInstruction: systemPrompt.trim() }
+              : {}),
+          },
+        }),
+      AI_REQUEST_TIMEOUT_MS,
+      `Google Gemini (${resolvedModel})`,
+    );
     return (
       response.text?.trim() ||
       'Gemini returned an empty response for this inspection.'
@@ -300,11 +468,16 @@ async function executeProviderGeneration(params: {
       images,
       systemPrompt,
     });
-    const upstreamRes = await fetch(spec.url, {
-      method: 'POST',
-      headers: spec.headers,
-      body: JSON.stringify(spec.body),
-    });
+    const upstreamRes = await fetchWithTimeout(
+      spec.url,
+      {
+        method: 'POST',
+        headers: spec.headers,
+        body: JSON.stringify(spec.body),
+      },
+      AI_REQUEST_TIMEOUT_MS,
+      'Anthropic',
+    );
     const json = (await upstreamRes.json().catch(() => null)) as unknown;
     if (!upstreamRes.ok) {
       throw new Error(readApiErrorMessage(json, upstreamRes.status));
@@ -327,11 +500,16 @@ async function executeProviderGeneration(params: {
     origin: appOrigin,
   });
 
-  const upstreamRes = await fetch(spec.url, {
-    method: 'POST',
-    headers: spec.headers,
-    body: JSON.stringify(spec.body),
-  });
+  const upstreamRes = await fetchWithTimeout(
+    spec.url,
+    {
+      method: 'POST',
+      headers: spec.headers,
+      body: JSON.stringify(spec.body),
+    },
+    AI_REQUEST_TIMEOUT_MS,
+    meta.name,
+  );
   const json = (await upstreamRes.json().catch(() => null)) as unknown;
   if (!upstreamRes.ok) {
     throw new Error(readApiErrorMessage(json, upstreamRes.status));
@@ -442,14 +620,28 @@ export async function startServer() {
         ? body.provider
         : 'google';
     const meta = getProviderMeta(providerId);
-    const resolvedModel =
-      typeof body.model === 'string' && body.model.trim()
-        ? body.model.trim()
-        : meta.defaultModel;
+    const envVarName = PROVIDER_ENV_KEYS[providerId] ?? meta.envVarName;
+    const resolvedModel = normalizeProviderModel(providerId, body.model);
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const images = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
+    const keySource = getKeySourceLabel(requestApiKey, envVarName);
+
+    console.log(
+      `[api] POST ${req.path} received (provider=${providerId}, model=${resolvedModel}, keySource=${keySource}, images=${images.length}, promptChars=${promptText.length})`,
+    );
+
+    if (keySource === 'none') {
+      console.error(
+        `[api] POST ${req.path} rejected (401 MISSING_API_KEY for provider=${providerId})`,
+      );
+      res.status(401).json({
+        error: MISSING_API_KEY_MESSAGE,
+        code: MISSING_API_KEY_CODE,
+      });
+      return;
+    }
 
     try {
       const text = await executeProviderGeneration({
@@ -460,12 +652,18 @@ export async function startServer() {
         images,
         systemPrompt,
       });
+      console.log(
+        `[api] POST ${req.path} succeeded (provider=${providerId}, model=${resolvedModel}, responseChars=${text.length})`,
+      );
       res.json({ text });
     } catch (error) {
       const formatted = formatServerProviderError(
         meta.name,
         meta.envVarName,
         error,
+      );
+      console.error(
+        `[api] POST ${req.path} failed (status=${formatted.status}, provider=${providerId}, model=${resolvedModel}): ${formatted.message}`,
       );
       res.status(formatted.status).json({
         error: formatted.message,
@@ -488,14 +686,25 @@ export async function startServer() {
       return;
     }
 
-    const resolvedModel =
-      typeof body.model === 'string' && body.model.trim()
-        ? body.model.trim()
-        : 'gemini-4-hydrogen';
+    const resolvedModel = normalizeProviderModel('google', body.model);
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const images = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
+    const keySource = getKeySourceLabel(requestApiKey, 'GEMINI_API_KEY');
+
+    console.log(
+      `[api] POST /api/gemini/generate received (model=${resolvedModel}, keySource=${keySource}, images=${images.length})`,
+    );
+
+    if (keySource === 'none') {
+      console.error('[api] POST /api/gemini/generate rejected (401 MISSING_API_KEY)');
+      res.status(401).json({
+        error: MISSING_API_KEY_MESSAGE,
+        code: MISSING_API_KEY_CODE,
+      });
+      return;
+    }
 
     try {
       const text = await executeProviderGeneration({
@@ -506,12 +715,18 @@ export async function startServer() {
         images,
         systemPrompt,
       });
+      console.log(
+        `[api] POST /api/gemini/generate succeeded (model=${resolvedModel}, responseChars=${text.length})`,
+      );
       res.json({ text });
     } catch (error) {
       const formatted = formatServerProviderError(
         'Google',
         'GEMINI_API_KEY',
         error,
+      );
+      console.error(
+        `[api] POST /api/gemini/generate failed (status=${formatted.status}, model=${resolvedModel}): ${formatted.message}`,
       );
       res.status(formatted.status).json({
         error: formatted.message,
@@ -531,13 +746,15 @@ export async function startServer() {
       return;
     }
 
-    const resolvedModel =
-      typeof body.model === 'string' && body.model.trim()
-        ? body.model.trim()
-        : 'gemini-4-hydrogen';
+    const resolvedModel = normalizeProviderModel('google', body.model);
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
+    const keySource = getKeySourceLabel(requestApiKey, 'GEMINI_API_KEY');
+
+    console.log(
+      `[api] POST /api/gemini/stream received (model=${resolvedModel}, keySource=${keySource})`,
+    );
 
     let ai: GoogleGenAI;
     try {
@@ -547,6 +764,9 @@ export async function startServer() {
         'Google',
         'GEMINI_API_KEY',
         error,
+      );
+      console.error(
+        `[api] POST /api/gemini/stream failed before stream (status=${formatted.status}): ${formatted.message}`,
       );
       res.status(formatted.status).json({
         error: formatted.message,
@@ -562,13 +782,19 @@ export async function startServer() {
     try {
       const parts = buildGeminiParts(promptText, body.images);
 
-      const streamResponse = await ai.models.generateContentStream({
-        model: resolvedModel,
-        contents: { parts },
-        ...(systemPrompt
-          ? { config: { systemInstruction: systemPrompt } }
-          : {}),
-      });
+      const streamResponse = await runWithAbortTimeout(
+        (abortSignal) =>
+          ai.models.generateContentStream({
+            model: resolvedModel,
+            contents: { parts },
+            config: {
+              abortSignal,
+              ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
+            },
+          }),
+        AI_REQUEST_TIMEOUT_MS,
+        `Google Gemini Stream (${resolvedModel})`,
+      );
 
       for await (const chunk of streamResponse) {
         const c = chunk as GenerateContentResponse;
@@ -584,6 +810,9 @@ export async function startServer() {
         'Google',
         'GEMINI_API_KEY',
         error,
+      );
+      console.error(
+        `[api] POST /api/gemini/stream error (status=${formatted.status}): ${formatted.message}`,
       );
       res.write(`data: ${JSON.stringify({ error: formatted.message })}\n\n`);
       res.end();
@@ -609,11 +838,18 @@ export async function startServer() {
       return;
     }
 
-    const geoSpyKey = readServerEnvKey('GEOSPY_API_KEY');
+    const requestKey = extractRequestApiKey(req);
+    const geoSpyKey = resolveEffectiveApiKey(requestKey, 'GEOSPY_API_KEY');
+    console.log(
+      `[api] POST /api/osint/geospy received (file=${fileName}, keySource=${getKeySourceLabel(requestKey, 'GEOSPY_API_KEY')})`,
+    );
+
     if (!geoSpyKey) {
-      res.status(403).json({
+      console.error('[api] POST /api/osint/geospy rejected (401 MISSING_API_KEY)');
+      res.status(401).json({
         error:
-          'GEOSPY_API_KEY is not configured on the server. Add GEOSPY_API_KEY in the Settings > Secrets panel.',
+          'GEOSPY_API_KEY is not configured. Add GEOSPY_API_KEY in .env or pass a key.',
+        code: MISSING_API_KEY_CODE,
       });
       return;
     }
@@ -624,13 +860,18 @@ export async function startServer() {
       const formData = new FormData();
       formData.append('file', blob, fileName);
 
-      const upstreamRes = await fetch(GEOSPY_PREDICT_ENDPOINT, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${geoSpyKey}`,
+      const upstreamRes = await fetchWithTimeout(
+        GEOSPY_PREDICT_ENDPOINT,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${geoSpyKey}`,
+          },
+          body: formData,
         },
-        body: formData,
-      });
+        AI_REQUEST_TIMEOUT_MS,
+        'GeoSpy',
+      );
 
       if (!upstreamRes.ok) {
         let errorDetail = `GeoSpy API request failed (${upstreamRes.status}).`;
@@ -648,6 +889,9 @@ export async function startServer() {
         } catch {
           // Ignore non-JSON error body
         }
+        console.error(
+          `[api] POST /api/osint/geospy upstream error (${upstreamRes.status}): ${errorDetail}`,
+        );
         res.status(upstreamRes.status).json({ error: errorDetail });
         return;
       }
@@ -655,6 +899,7 @@ export async function startServer() {
       const data = (await upstreamRes.json()) as unknown;
       const prediction = parseGeoSpyResponse(data);
       if (!prediction) {
+        console.error('[api] POST /api/osint/geospy invalid prediction payload');
         res.status(502).json({
           error: 'GeoSpy response did not include valid lat/lng coordinates.',
         });
@@ -666,6 +911,9 @@ export async function startServer() {
         'GeoSpy',
         'GEOSPY_API_KEY',
         error,
+      );
+      console.error(
+        `[api] POST /api/osint/geospy failed (status=${formatted.status}): ${formatted.message}`,
       );
       res.status(formatted.status).json({ error: formatted.message });
     }
@@ -695,6 +943,7 @@ export async function startServer() {
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Server username pivot failed.';
+      console.error(`[api] POST /api/osint/pivot failed: ${message}`);
       res.status(500).json({ error: message });
     }
   });
@@ -708,7 +957,12 @@ export async function startServer() {
       return;
     }
 
-    const shodanKey = resolveEffectiveApiKey(body.apiKey, 'SHODAN_API_KEY');
+    const requestShodanKey = extractRequestApiKey(req, body.apiKey);
+    const shodanKey = resolveEffectiveApiKey(requestShodanKey, 'SHODAN_API_KEY');
+    console.log(
+      `[api] POST /api/osint/shodan received (query=${query}, keySource=${getKeySourceLabel(requestShodanKey, 'SHODAN_API_KEY')})`,
+    );
+
     if (!shodanKey) {
       res.status(403).json({
         error:
@@ -718,22 +972,27 @@ export async function startServer() {
     }
 
     const { url: upstreamUrl, mode } = buildShodanUpstreamUrl(query, shodanKey);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
 
     try {
-      const upstreamRes = await fetch(upstreamUrl, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'Trace-OSINT/1.0',
+      const upstreamRes = await fetchWithTimeout(
+        upstreamUrl,
+        {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': 'Trace-OSINT/1.0',
+          },
         },
-        signal: controller.signal,
-      });
+        15_000,
+        'Shodan',
+      );
 
       const payload = (await upstreamRes.json().catch(() => null)) as unknown;
       if (!upstreamRes.ok) {
         const message = readApiErrorMessage(payload, upstreamRes.status);
+        console.error(
+          `[api] POST /api/osint/shodan upstream error (${upstreamRes.status}): ${message}`,
+        );
         res.status(upstreamRes.status).json({ error: message });
         return;
       }
@@ -746,15 +1005,12 @@ export async function startServer() {
         results: normalized.results,
       });
     } catch (error) {
-      const isAbort = error instanceof Error && error.name === 'AbortError';
-      const message = isAbort
-        ? 'Shodan API request timed out after 10 seconds.'
-        : error instanceof Error
-          ? error.message
-          : 'Shodan lookup failed on the server.';
-      res.status(isAbort ? 504 : 502).json({ error: message });
-    } finally {
-      clearTimeout(timer);
+      const isTimeout = error instanceof UpstreamTimeoutError;
+      const message = isTimeout
+        ? error.message
+        : `Shodan lookup failed on the server (${describeErrorCause(error)}).`;
+      console.error(`[api] POST /api/osint/shodan failed: ${message}`);
+      res.status(isTimeout ? 504 : 502).json({ error: message });
     }
   });
 
@@ -768,20 +1024,26 @@ export async function startServer() {
     }
 
     const cdxUrl = buildWaybackCdxUrl(rawUrl, 20);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12_000);
+    console.log(`[api] POST /api/osint/archive received (url=${rawUrl})`);
 
     try {
-      const upstreamRes = await fetch(cdxUrl, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'Trace-OSINT/1.0',
+      const upstreamRes = await fetchWithTimeout(
+        cdxUrl,
+        {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': 'Trace-OSINT/1.0',
+          },
         },
-        signal: controller.signal,
-      });
+        AI_REQUEST_TIMEOUT_MS,
+        'Wayback Machine CDX',
+      );
 
       if (!upstreamRes.ok) {
+        console.error(
+          `[api] POST /api/osint/archive upstream HTTP ${upstreamRes.status} for ${rawUrl}`,
+        );
         res.status(upstreamRes.status).json({
           error: `Wayback Machine CDX API returned HTTP ${upstreamRes.status}.`,
         });
@@ -790,20 +1052,20 @@ export async function startServer() {
 
       const payload = (await upstreamRes.json().catch(() => null)) as unknown;
       const snapshots = parseWaybackCdxResponse(payload);
+      console.log(
+        `[api] POST /api/osint/archive succeeded (url=${rawUrl}, snapshots=${snapshots.length})`,
+      );
       res.json({
         url: rawUrl,
         snapshots,
       });
     } catch (error) {
-      const isAbort = error instanceof Error && error.name === 'AbortError';
-      const message = isAbort
-        ? 'Wayback Machine CDX lookup timed out after 12 seconds.'
-        : error instanceof Error
-          ? error.message
-          : 'Wayback Machine archive lookup failed.';
-      res.status(isAbort ? 504 : 502).json({ error: message });
-    } finally {
-      clearTimeout(timer);
+      const isTimeout = error instanceof UpstreamTimeoutError;
+      const message = isTimeout
+        ? error.message
+        : `Wayback Machine archive lookup failed (${describeErrorCause(error)}).`;
+      console.error(`[api] POST /api/osint/archive failed: ${message}`);
+      res.status(isTimeout ? 504 : 502).json({ error: message });
     }
   });
 
@@ -824,10 +1086,17 @@ export async function startServer() {
         : 'google';
     const inlineImages = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
+    const envVarName = providerId === 'openai' ? 'OPENAI_API_KEY' : 'GEMINI_API_KEY';
+    const keySource = getKeySourceLabel(requestApiKey, envVarName);
+
+    console.log(
+      `[api] POST /api/image/generate received (provider=${providerId}, keySource=${keySource}, refImages=${inlineImages.length}, promptChars=${rawPrompt.length})`,
+    );
 
     if (providerId === 'openai') {
       const openAiKey = resolveEffectiveApiKey(requestApiKey, 'OPENAI_API_KEY');
       if (!openAiKey) {
+        console.error('[api] POST /api/image/generate rejected (401 MISSING_API_KEY for openai)');
         res.status(401).json({
           error: MISSING_API_KEY_MESSAGE,
           code: MISSING_API_KEY_CODE,
@@ -840,11 +1109,16 @@ export async function startServer() {
           apiKey: openAiKey,
           prompt: rawPrompt,
         });
-        const upstreamRes = await fetch(dalleSpec.url, {
-          method: 'POST',
-          headers: dalleSpec.headers,
-          body: JSON.stringify(dalleSpec.body),
-        });
+        const upstreamRes = await fetchWithTimeout(
+          dalleSpec.url,
+          {
+            method: 'POST',
+            headers: dalleSpec.headers,
+            body: JSON.stringify(dalleSpec.body),
+          },
+          AI_REQUEST_TIMEOUT_MS,
+          'OpenAI DALL-E 3',
+        );
         const json = (await upstreamRes.json().catch(() => null)) as unknown;
         if (!upstreamRes.ok) {
           throw new Error(readApiErrorMessage(json, upstreamRes.status));
@@ -855,6 +1129,7 @@ export async function startServer() {
           throw new Error('DALL-E 3 returned an empty image payload.');
         }
 
+        console.log('[api] POST /api/image/generate succeeded (provider=openai, model=dall-e-3)');
         res.json({
           imageUrl,
           model: DALLE_MODEL_ID,
@@ -865,6 +1140,9 @@ export async function startServer() {
           'OpenAI DALL-E 3',
           'OPENAI_API_KEY',
           error,
+        );
+        console.error(
+          `[api] POST /api/image/generate failed (provider=openai, status=${formatted.status}): ${formatted.message}`,
         );
         res.status(formatted.status).json({
           error: formatted.message,
@@ -881,52 +1159,91 @@ export async function startServer() {
       return;
     }
 
-    // Provider is Google: Call Imagen API (imagen-3.0-generate-001)
+    // Provider is Google: Call Imagen API with 30s timeout and model fallback
     try {
       const ai = getGeminiClient(requestApiKey);
       let finalPrompt = rawPrompt;
 
-      // If connected ImageNodes were passed, optionally extract brief visual traits to enrich the Imagen prompt
+      // If connected ImageNodes were passed, optionally extract brief visual traits (capped at 10s)
       if (inlineImages.length > 0) {
         try {
           const visionParts = buildGeminiParts(
             'Summarize the key physical subject, attire, and facial/structural traits visible in this reference frame in 2 concise sentences for a forensic composite.',
             inlineImages,
           );
-          const visionSummary = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: { parts: visionParts },
-          });
+          const visionSummary = await runWithAbortTimeout(
+            (abortSignal) =>
+              ai.models.generateContent({
+                model: DEFAULT_GEMINI_MODEL,
+                contents: { parts: visionParts },
+                config: { abortSignal },
+              }),
+            10_000,
+            'Google Gemini Vision Enrichment',
+          );
           const summaryText = visionSummary.text?.trim();
           if (summaryText) {
             finalPrompt = `${rawPrompt} | Visual Traits from Connected ImageNode: ${summaryText}`;
           }
-        } catch {
-          // Proceed with rawPrompt if vision enrichment fails
+        } catch (visionErr) {
+          console.warn(
+            `[api] POST /api/image/generate vision enrichment skipped: ${describeErrorCause(visionErr)}`,
+          );
         }
       }
 
-      const imagenResponse = await ai.models.generateImages({
-        model: IMAGEN_MODEL_ID,
-        prompt: finalPrompt,
-        config: {
-          numberOfImages: 1,
-          outputMimeType: 'image/jpeg',
-          aspectRatio: '1:1',
-        },
-      });
+      let base64Bytes: string | undefined;
+      let modelUsed: string = IMAGEN_MODEL_ID;
+      let lastError: unknown = null;
 
-      const base64Bytes =
-        imagenResponse.generatedImages?.[0]?.image?.imageBytes;
+      for (const candidateModel of IMAGEN_FALLBACK_MODELS) {
+        try {
+          const imagenResponse = await runWithAbortTimeout(
+            (abortSignal) =>
+              ai.models.generateImages({
+                model: candidateModel,
+                prompt: finalPrompt,
+                config: {
+                  abortSignal,
+                  numberOfImages: 1,
+                  outputMimeType: 'image/jpeg',
+                  aspectRatio: '1:1',
+                },
+              }),
+            AI_REQUEST_TIMEOUT_MS,
+            `Google Imagen (${candidateModel})`,
+          );
+          base64Bytes = imagenResponse.generatedImages?.[0]?.image?.imageBytes;
+          modelUsed = candidateModel;
+          if (base64Bytes) break;
+        } catch (candidateErr) {
+          lastError = candidateErr;
+          const msg =
+            candidateErr instanceof Error ? candidateErr.message : String(candidateErr);
+          // Only fall back to newer Imagen model IDs if the model ID was NOT_FOUND
+          if (msg.includes('NOT_FOUND') || msg.includes('is not found')) {
+            console.warn(
+              `[api] Imagen model ${candidateModel} unavailable, trying next fallback...`,
+            );
+            continue;
+          }
+          throw candidateErr;
+        }
+      }
+
       if (!base64Bytes) {
+        if (lastError) throw lastError;
         throw new Error(
-          'Imagen API (imagen-3.0-generate-001) returned no generated image bytes.',
+          `Imagen API (${modelUsed}) returned no generated image bytes.`,
         );
       }
 
+      console.log(
+        `[api] POST /api/image/generate succeeded (provider=google, model=${modelUsed})`,
+      );
       res.json({
         imageUrl: `data:image/jpeg;base64,${base64Bytes}`,
-        model: IMAGEN_MODEL_ID,
+        model: modelUsed,
         provider: 'google',
       });
     } catch (error) {
@@ -934,6 +1251,9 @@ export async function startServer() {
         'Google Imagen',
         'GEMINI_API_KEY',
         error,
+      );
+      console.error(
+        `[api] POST /api/image/generate failed (provider=google, status=${formatted.status}): ${formatted.message}`,
       );
       res.status(formatted.status).json({
         error: formatted.message,

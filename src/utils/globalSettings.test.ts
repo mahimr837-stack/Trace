@@ -236,3 +236,52 @@ test('AI utilities pass global API key in both x-api-key header and JSON body', 
 
   mockStorage.clear();
 });
+
+test('auto-migrates legacy gemini-4-hydrogen model to gemini-2.5-flash and aborts hung requests on timeout', async () => {
+  const mockStorage = createMemoryStorage();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: mockStorage,
+    configurable: true,
+    writable: true,
+  });
+
+  mockStorage.setItem(
+    GLOBAL_SETTINGS_STORAGE_KEY,
+    JSON.stringify({
+      provider: 'google',
+      apiKey: 'AIzaSyTestKey',
+      model: 'gemini-4-hydrogen',
+      providerConfigs: {
+        google: { apiKey: 'AIzaSyTestKey', model: 'gemini-4-hydrogen' },
+      },
+    }),
+  );
+
+  const migrated = readGlobalSettings();
+  assert.equal(migrated.model, 'gemini-2.5-flash');
+  assert.equal(migrated.providerConfigs.google.model, 'gemini-2.5-flash');
+
+  const hangingFetch = ((_url: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const abortErr = new Error('The operation was aborted.');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+      });
+    })) as typeof fetch;
+
+  await assert.rejects(
+    () =>
+      runMultiProviderAnalysis({
+        provider: 'google',
+        apiKey: 'AIzaSyTestKey',
+        promptText: 'Ping',
+        images: [],
+        fetchImpl: hangingFetch,
+        timeoutMs: 30,
+      }),
+    /timed out/i,
+  );
+
+  mockStorage.clear();
+});

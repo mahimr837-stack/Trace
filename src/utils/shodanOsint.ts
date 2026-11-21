@@ -224,11 +224,30 @@ export async function runShodanSearch(params: {
   }
 
   const fetchFn = params.fetchImpl ?? fetch;
-  const response = await fetchFn(SERVER_SHODAN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, apiKey }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+
+  let response: Response;
+  try {
+    response = await fetchFn(SERVER_SHODAN_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, apiKey }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort) {
+      throw new Error('Shodan lookup timed out after 20s.');
+    }
+    throw new Error(
+      error instanceof Error
+        ? `Network error contacting Shodan proxy: ${error.message}`
+        : 'Network error contacting Shodan proxy.',
+    );
+  } finally {
+    clearTimeout(timer);
+  }
 
   const payload = (await response.json().catch(() => null)) as
     | (Partial<ShodanSearchResponse> & { error?: unknown; message?: unknown })

@@ -87,7 +87,10 @@ import {
   CANVAS_SAVE_DEBOUNCE_MS,
   createDebouncedTask,
   loadProjectsFromIdb,
+  loadProjectsSyncBackup,
   type PersistedProjectsState,
+  pickFresherProject,
+  saveProjectsSyncBackup,
   saveProjectsToIdb,
   serializeProjectsState,
 } from '../utils/canvasPersistence';
@@ -105,6 +108,7 @@ import {
   fetchProjectById,
   fetchProjectList,
   saveProjectToServer,
+  saveProjectToServerOnUnload,
 } from '../utils/projectApi';
 
 const PORT_AERIAL_URL = '/src/assets/images/osint_port_aerial_1794763184788.jpg';
@@ -242,9 +246,19 @@ async function resolveImageToInlinePart(imageUrl: string): Promise<ParsedInlineI
   if (direct) return direct;
 
   // Convert local static asset URLs into base64 inlineData via fetch + FileReader
-  const response = await fetch(imageUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  let response: Response;
+  try {
+    response = await fetch(imageUrl, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!response.ok) return null;
   const blob = await response.blob();
+  if (blob.type && !blob.type.startsWith('image/')) {
+    return null;
+  }
   const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -291,6 +305,7 @@ function syncActiveProjectInList(
 ): OsintProject[] {
   if (!currentProjectId) return projects;
   let changed = false;
+  const nowIso = new Date().toISOString();
   const updated = projects.map((proj) => {
     if (proj.id !== currentProjectId) return proj;
     if (
@@ -304,6 +319,7 @@ function syncActiveProjectInList(
     changed = true;
     return {
       ...proj,
+      updatedAt: nowIso,
       nodes,
       edges,
       nodeCounter,
@@ -317,6 +333,7 @@ function syncActiveProjectInList(
 
 const debouncedProjectsSaver = createDebouncedTask(
   async (payload: PersistedProjectsState) => {
+    saveProjectsSyncBackup(payload);
     try {
       await saveProjectsToIdb(payload);
     } catch {
@@ -339,9 +356,59 @@ const debouncedServerProjectSaver = createDebouncedTask(
 
 let suppressAutoSave = false;
 
+function flushCanvasStateImmediately(options?: { isUnloading?: boolean }): void {
+  const isUnloading = Boolean(options?.isUnloading);
+  const state = useCanvasStore.getState();
+
+  debouncedProjectsSaver.cancel();
+  debouncedServerProjectSaver.cancel();
+
+  if (!state.isHydrated || suppressAutoSave) {
+    return;
+  }
+
+  const currentProj = state.projects.find((p) => p.id === state.currentProjectId);
+  const latestProjects =
+    currentProj && !currentProj.isSummaryOnly
+      ? syncActiveProjectInList(
+          state.projects,
+          state.currentProjectId,
+          state.nodes,
+          state.edges,
+          state.nodeCounter,
+        )
+      : state.projects;
+
+  const serialized = serializeProjectsState({
+    projects: latestProjects,
+    currentProjectId: state.currentProjectId,
+  });
+
+  // 1. Synchronous write-ahead backup so rapid navigation/unload never loses nodes
+  saveProjectsSyncBackup(serialized);
+
+  // 2. Immediate IndexedDB flush (bypasses debounce timer)
+  void saveProjectsToIdb(serialized).catch(() => {});
+
+  // 3. Persist active project to backend /api/projects/save
+  const activeProject = serialized.projects.find(
+    (p) => p.id === serialized.currentProjectId,
+  );
+  if (activeProject && !activeProject.isSummaryOnly) {
+    if (isUnloading) {
+      saveProjectToServerOnUnload(activeProject);
+    } else {
+      void saveProjectToServer(activeProject).catch(() => {});
+    }
+  }
+}
+
 export function flushPendingCanvasSave(): void {
-  debouncedProjectsSaver.flush();
-  debouncedServerProjectSaver.flush();
+  flushCanvasStateImmediately({ isUnloading: true });
+}
+
+export function flushCanvasOnVisibilityHidden(): void {
+  flushCanvasStateImmediately({ isUnloading: false });
 }
 
 interface CanvasState {
@@ -358,6 +425,7 @@ interface CanvasState {
   providerConfigs: Record<LlmProviderId, { apiKey: string; model: string }>;
   alertMessage: string | null;
   analyzingChatIds: Record<string, boolean>;
+  chatNodeErrors: Record<string, string | null>;
   generatingDorkIds: Record<string, boolean>;
   extractingGeoIntelIds: Record<string, boolean>;
   pivotingNodeIds: Record<string, boolean>;
@@ -485,6 +553,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   providerConfigs: initialGlobalSettings.providerConfigs,
   alertMessage: null,
   analyzingChatIds: {},
+  chatNodeErrors: {},
   generatingDorkIds: {},
   extractingGeoIntelIds: {},
   pivotingNodeIds: {},
@@ -634,7 +703,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   loadProject: (id) => {
-    debouncedServerProjectSaver.flush();
+    flushCanvasStateImmediately({ isUnloading: false });
+
+    const syncBackup = loadProjectsSyncBackup();
+    const syncCandidate = syncBackup?.projects.find((p) => p.id === id) ?? null;
 
     suppressAutoSave = true;
     try {
@@ -652,16 +724,20 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
                 state.nodeCounter,
               )
             : state.projects;
-        const target = syncedProjects.find((p) => p.id === id);
+        const memTarget = syncedProjects.find((p) => p.id === id) ?? null;
+        const target = pickFresherProject(memTarget, syncCandidate);
         if (!target) {
           return { projects: syncedProjects, currentProjectId: id };
         }
 
         const nextCounter =
           target.nodeCounter ?? Math.max(target.nodes.length + 1, 1);
+        const nextProjects = syncedProjects.some((p) => p.id === target.id)
+          ? syncedProjects.map((p) => (p.id === target.id ? target : p))
+          : [target, ...syncedProjects];
 
         return {
-          projects: syncedProjects,
+          projects: nextProjects,
           currentProjectId: target.id,
           nodes: target.nodes,
           edges: target.edges,
@@ -670,6 +746,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           suspectImageUrls: extractSuspectUrlsFromNodes(target.nodes),
           alertMessage: null,
           analyzingChatIds: {},
+          chatNodeErrors: {},
           generatingDorkIds: {},
           extractingGeoIntelIds: {},
           pivotingNodeIds: {},
@@ -680,41 +757,68 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       suppressAutoSave = false;
     }
 
-    // Load full project JSON from backend filesystem (/api/projects/:id)
-    void fetchProjectById(id)
-      .then((diskProject) => {
-        if (!diskProject) return;
+    // Reconcile full project graph across backend disk (/api/projects/:id), IndexedDB, and sync backup
+    void Promise.all([
+      fetchProjectById(id).catch(() => null),
+      loadProjectsFromIdb().catch(() => null),
+    ])
+      .then(([diskProject, idbState]) => {
+        const idbProject = idbState?.projects.find((p) => p.id === id) ?? null;
+        const latestSync = loadProjectsSyncBackup()?.projects.find((p) => p.id === id) ?? null;
+        const memProject = get().projects.find((p) => p.id === id) ?? null;
+
+        const localBest = pickFresherProject(
+          pickFresherProject(memProject, idbProject),
+          latestSync,
+        );
+        const winner = pickFresherProject(diskProject, localBest);
+        if (!winner || winner.isSummaryOnly) return;
+
+        // If local IndexedDB/backup was fresher than disk, sync the full graph back to disk
+        if (winner !== diskProject) {
+          void saveProjectToServer(winner).catch(() => {});
+        }
+
+        const normalizedWinner: OsintProject = {
+          ...winner,
+          nodeCount: winner.nodes.length,
+          edgeCount: winner.edges.length,
+          isSummaryOnly: false,
+        };
+
         suppressAutoSave = true;
         try {
           set((state) => {
             const existsInList = state.projects.some(
-              (p) => p.id === diskProject.id,
+              (p) => p.id === normalizedWinner.id,
             );
             const nextProjects = existsInList
               ? state.projects.map((p) =>
-                  p.id === diskProject.id ? diskProject : p,
+                  p.id === normalizedWinner.id ? normalizedWinner : p,
                 )
-              : [diskProject, ...state.projects];
+              : [normalizedWinner, ...state.projects];
 
-            if (state.currentProjectId !== diskProject.id) {
+            if (state.currentProjectId !== normalizedWinner.id) {
               return { projects: nextProjects };
             }
 
             const nextCounter =
-              diskProject.nodeCounter ??
-              Math.max(diskProject.nodes.length + 1, 1);
+              normalizedWinner.nodeCounter ??
+              Math.max(normalizedWinner.nodes.length + 1, 1);
 
             return {
               projects: nextProjects,
-              currentProjectId: diskProject.id,
-              nodes: diskProject.nodes,
-              edges: diskProject.edges,
+              currentProjectId: normalizedWinner.id,
+              nodes: normalizedWinner.nodes,
+              edges: normalizedWinner.edges,
               nodeCounter: nextCounter,
               chatContextMap: computeChatContextMap(
-                diskProject.nodes,
-                diskProject.edges,
+                normalizedWinner.nodes,
+                normalizedWinner.edges,
               ),
-              suspectImageUrls: extractSuspectUrlsFromNodes(diskProject.nodes),
+              suspectImageUrls: extractSuspectUrlsFromNodes(
+                normalizedWinner.nodes,
+              ),
             };
           });
         } finally {
@@ -728,24 +832,37 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   fetchProjectsFromServer: async () => {
     try {
-      const summaries = await fetchProjectList();
+      const [summaries, idbState] = await Promise.all([
+        fetchProjectList(),
+        loadProjectsFromIdb().catch(() => null),
+      ]);
+      const syncState = loadProjectsSyncBackup();
+
+      const localById = new Map<string, OsintProject>();
+      for (const proj of idbState?.projects ?? []) {
+        if (!proj.isSummaryOnly) {
+          localById.set(proj.id, proj);
+        }
+      }
+      for (const proj of syncState?.projects ?? []) {
+        if (!proj.isSummaryOnly) {
+          const prev = localById.get(proj.id);
+          const fresher = pickFresherProject(prev, proj);
+          if (fresher) localById.set(proj.id, fresher);
+        }
+      }
+
       suppressAutoSave = true;
       try {
         set((state) => {
           const existingById = new Map(state.projects.map((p) => [p.id, p]));
           const mergedProjects: OsintProject[] = summaries.map((summary) => {
             const existing = existingById.get(summary.id);
-            if (existing && !existing.isSummaryOnly) {
-              return {
-                ...existing,
-                name: summary.name,
-                createdAt: summary.createdAt,
-                updatedAt: summary.updatedAt,
-                nodeCount: summary.nodeCount,
-                edgeCount: summary.edgeCount,
-              };
-            }
-            return {
+            const localFull = pickFresherProject(
+              existing && !existing.isSummaryOnly ? existing : null,
+              localById.get(summary.id) ?? null,
+            );
+            const summaryStub: OsintProject = {
               id: summary.id,
               name: summary.name,
               createdAt: summary.createdAt,
@@ -757,6 +874,22 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
               edgeCount: summary.edgeCount,
               isSummaryOnly: true,
             };
+
+            if (localFull && !localFull.isSummaryOnly) {
+              const serverMs = summary.updatedAt ? Date.parse(summary.updatedAt) : 0;
+              const localMs = localFull.updatedAt ? Date.parse(localFull.updatedAt) : 0;
+              if (localMs >= serverMs) {
+                return {
+                  ...localFull,
+                  nodeCount: localFull.nodes.length,
+                  edgeCount: localFull.edges.length,
+                  isSummaryOnly: false,
+                };
+              }
+              // Disk is strictly newer than local cache — mark summary so loadProject fetches full disk JSON
+              return summaryStub;
+            }
+            return summaryStub;
           });
 
           const nextCurrentId =
@@ -784,50 +917,110 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     if (get().hasAttemptedHydration) return;
     set({ hasAttemptedHydration: true });
 
-    try {
-      const serverSummaries = await fetchProjectList();
-      if (serverSummaries.length > 0) {
-        const mergedProjects: OsintProject[] = serverSummaries.map((s) => ({
-          id: s.id,
-          name: s.name,
-          createdAt: s.createdAt,
-          updatedAt: s.updatedAt,
-          nodes: [],
-          edges: [],
-          nodeCounter: Math.max(s.nodeCount + 1, 1),
-          nodeCount: s.nodeCount,
-          edgeCount: s.edgeCount,
-          isSummaryOnly: true,
-        }));
+    const [idbState, serverSummaries] = await Promise.all([
+      loadProjectsFromIdb().catch(() => null),
+      fetchProjectList().catch(() => null),
+    ]);
+    const syncState = loadProjectsSyncBackup();
 
-        const firstId = mergedProjects[0].id;
-        const firstFull = await fetchProjectById(firstId).catch(() => null);
+    // Build reconciled local full-project map (IndexedDB + synchronous localStorage backup)
+    const localFullById = new Map<string, OsintProject>();
+    for (const proj of idbState?.projects ?? []) {
+      if (!proj.isSummaryOnly) {
+        localFullById.set(proj.id, proj);
+      }
+    }
+    for (const proj of syncState?.projects ?? []) {
+      if (!proj.isSummaryOnly) {
+        const prev = localFullById.get(proj.id);
+        const fresher = pickFresherProject(prev, proj);
+        if (fresher) localFullById.set(proj.id, fresher);
+      }
+    }
+
+    const preferredLocalCurrentId =
+      syncState?.currentProjectId ?? idbState?.currentProjectId ?? null;
+
+    if (serverSummaries !== null) {
+      if (serverSummaries.length > 0) {
+        const mergedProjects: OsintProject[] = serverSummaries.map((s) => {
+          const localFull = localFullById.get(s.id) ?? null;
+          if (localFull) {
+            const serverMs = s.updatedAt ? Date.parse(s.updatedAt) : 0;
+            const localMs = localFull.updatedAt ? Date.parse(localFull.updatedAt) : 0;
+            if (localMs >= serverMs) {
+              return {
+                ...localFull,
+                nodeCount: localFull.nodes.length,
+                edgeCount: localFull.edges.length,
+                isSummaryOnly: false,
+              };
+            }
+          }
+          return {
+            id: s.id,
+            name: s.name,
+            createdAt: s.createdAt,
+            updatedAt: s.updatedAt,
+            nodes: [],
+            edges: [],
+            nodeCounter: Math.max(s.nodeCount + 1, 1),
+            nodeCount: s.nodeCount,
+            edgeCount: s.edgeCount,
+            isSummaryOnly: true,
+          };
+        });
+
+        const activeId =
+          preferredLocalCurrentId &&
+          mergedProjects.some((p) => p.id === preferredLocalCurrentId)
+            ? preferredLocalCurrentId
+            : mergedProjects[0].id;
+
+        const diskActive = await fetchProjectById(activeId).catch(() => null);
+        const reconciledActive = pickFresherProject(
+          diskActive,
+          localFullById.get(activeId) ?? null,
+        );
+
+        if (reconciledActive && reconciledActive !== diskActive) {
+          void saveProjectToServer(reconciledActive).catch(() => {});
+        }
 
         suppressAutoSave = true;
         try {
-          if (firstFull) {
+          if (reconciledActive && !reconciledActive.isSummaryOnly) {
+            const normalizedActive: OsintProject = {
+              ...reconciledActive,
+              nodeCount: reconciledActive.nodes.length,
+              edgeCount: reconciledActive.edges.length,
+              isSummaryOnly: false,
+            };
             const hydratedList = mergedProjects.map((p) =>
-              p.id === firstFull.id ? firstFull : p,
+              p.id === normalizedActive.id ? normalizedActive : p,
             );
             const nextCounter =
-              firstFull.nodeCounter ?? Math.max(firstFull.nodes.length + 1, 1);
+              normalizedActive.nodeCounter ??
+              Math.max(normalizedActive.nodes.length + 1, 1);
             set({
               projects: hydratedList,
-              currentProjectId: firstFull.id,
-              nodes: firstFull.nodes,
-              edges: firstFull.edges,
+              currentProjectId: normalizedActive.id,
+              nodes: normalizedActive.nodes,
+              edges: normalizedActive.edges,
               nodeCounter: nextCounter,
               chatContextMap: computeChatContextMap(
-                firstFull.nodes,
-                firstFull.edges,
+                normalizedActive.nodes,
+                normalizedActive.edges,
               ),
-              suspectImageUrls: extractSuspectUrlsFromNodes(firstFull.nodes),
+              suspectImageUrls: extractSuspectUrlsFromNodes(
+                normalizedActive.nodes,
+              ),
               isHydrated: true,
             });
           } else {
             set({
               projects: mergedProjects,
-              currentProjectId: firstId,
+              currentProjectId: activeId,
               isHydrated: true,
             });
           }
@@ -837,22 +1030,22 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         return;
       }
 
-      // Server /data folder is currently empty — migrate any existing IndexedDB projects once
-      const saved = await loadProjectsFromIdb().catch(() => null);
+      // Server /data folder is empty — migrate any existing local IndexedDB / sync backup projects once
+      const localProjects = Array.from(localFullById.values());
       suppressAutoSave = true;
       try {
-        if (saved && saved.projects.length > 0) {
-          for (const proj of saved.projects) {
+        if (localProjects.length > 0) {
+          for (const proj of localProjects) {
             void saveProjectToServer(proj).catch(() => {});
           }
           const activeProject =
-            saved.projects.find((p) => p.id === saved.currentProjectId) ??
-            saved.projects[0];
+            localProjects.find((p) => p.id === preferredLocalCurrentId) ??
+            localProjects[0];
           const nextCounter =
             activeProject.nodeCounter ??
             Math.max(activeProject.nodes.length + 1, 1);
           set({
-            projects: saved.projects.map((p) => ({
+            projects: localProjects.map((p) => ({
               ...p,
               nodeCount: p.nodes.length,
               edgeCount: p.edges.length,
@@ -885,54 +1078,35 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         suppressAutoSave = false;
       }
       return;
-    } catch {
-      // Fallback to IndexedDB when backend /api/projects is unavailable
     }
 
+    // Backend /api/projects is unreachable — fall back to reconciled local IndexedDB + sync backup
+    const localProjects = Array.from(localFullById.values());
+    suppressAutoSave = true;
     try {
-      const saved = await loadProjectsFromIdb();
-      suppressAutoSave = true;
-      if (saved) {
+      if (localProjects.length > 0) {
         const activeProject =
-          saved.projects.find((p) => p.id === saved.currentProjectId) ??
-          saved.projects[0] ??
-          null;
-
-        if (activeProject) {
-          const nextCounter =
-            activeProject.nodeCounter ??
-            Math.max(activeProject.nodes.length + 1, 1);
-          set({
-            projects: saved.projects,
-            currentProjectId: activeProject.id,
-            nodes: activeProject.nodes,
-            edges: activeProject.edges,
-            nodeCounter: nextCounter,
-            chatContextMap: computeChatContextMap(
-              activeProject.nodes,
-              activeProject.edges,
-            ),
-            suspectImageUrls: extractSuspectUrlsFromNodes(activeProject.nodes),
-            isHydrated: true,
-          });
-        } else {
-          set({
-            projects: [],
-            currentProjectId: null,
-            nodes: [],
-            edges: [],
-            nodeCounter: 1,
-            chatContextMap: {},
-            suspectImageUrls: {},
-            isHydrated: true,
-          });
-        }
+          localProjects.find((p) => p.id === preferredLocalCurrentId) ??
+          localProjects[0];
+        const nextCounter =
+          activeProject.nodeCounter ??
+          Math.max(activeProject.nodes.length + 1, 1);
+        set({
+          projects: localProjects,
+          currentProjectId: activeProject.id,
+          nodes: activeProject.nodes,
+          edges: activeProject.edges,
+          nodeCounter: nextCounter,
+          chatContextMap: computeChatContextMap(
+            activeProject.nodes,
+            activeProject.edges,
+          ),
+          suspectImageUrls: extractSuspectUrlsFromNodes(activeProject.nodes),
+          isHydrated: true,
+        });
       } else {
         set({ isHydrated: true });
       }
-    } catch {
-      suppressAutoSave = true;
-      set({ isHydrated: true });
     } finally {
       suppressAutoSave = false;
     }
@@ -1258,6 +1432,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
   updateChatNodeDraftPrompt: (nodeId, draftPrompt) => {
     set((state) => ({
+      chatNodeErrors: state.chatNodeErrors[nodeId]
+        ? { ...state.chatNodeErrors, [nodeId]: null }
+        : state.chatNodeErrors,
       nodes: state.nodes.map((node) => {
         if (node.id !== nodeId || node.data.kind !== 'chat') return node;
         return {
@@ -1755,7 +1932,11 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt) {
-      set({ alertMessage: 'Enter an analysis prompt before clicking Analyze.' });
+      const msg = 'Enter an analysis prompt before clicking Analyze.';
+      set((state) => ({
+        alertMessage: msg,
+        chatNodeErrors: { ...state.chatNodeErrors, [chatNodeId]: msg },
+      }));
       return false;
     }
 
@@ -1771,10 +1952,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const hasExif = Boolean(contextEntry && contextEntry.connectedExifIds.length > 0);
 
     if (!contextEntry || (!hasImages && !hasEnhanced && !hasOcr && !hasExif)) {
-      set({
-        alertMessage:
-          'No ImageNodes or intelligence sources are connected to this ChatNode. Connect at least one ImageNode, OcrNode, or ExifNode.',
-      });
+      const msg =
+        'No ImageNodes or intelligence sources are connected to this ChatNode. Connect at least one ImageNode, OcrNode, or ExifNode.';
+      set((state) => ({
+        alertMessage: msg,
+        chatNodeErrors: { ...state.chatNodeErrors, [chatNodeId]: msg },
+      }));
       return false;
     }
 
@@ -1868,15 +2051,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     const imagesWithData = orderedVisualInputs.filter((item) => Boolean(item.imageUrl));
     if ((hasImages || hasEnhanced) && imagesWithData.length === 0 && !hasOcr && !hasExif) {
-      set({
-        alertMessage:
-          'Connected ImageNode(s) do not contain an uploaded image yet. Click a placeholder to load an image first.',
-      });
+      const msg =
+        'Connected ImageNode(s) do not contain an uploaded image yet. Click a placeholder to load an image first.';
+      set((state) => ({
+        alertMessage: msg,
+        chatNodeErrors: { ...state.chatNodeErrors, [chatNodeId]: msg },
+      }));
       return false;
     }
 
     set((state) => ({
       alertMessage: null,
+      chatNodeErrors: {
+        ...state.chatNodeErrors,
+        [chatNodeId]: null,
+      },
       analyzingChatIds: {
         ...state.analyzingChatIds,
         [chatNodeId]: true,
@@ -2021,10 +2210,17 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return true;
     } catch (error) {
       const errorMessage =
-        error instanceof Error ? error.message : 'Unexpected error calling Gemini API.';
+        error instanceof Error ? error.message : 'Unexpected error calling AI API.';
 
       if (isApiAuthError(error)) {
-        set({ alertMessage: errorMessage || MISSING_API_KEY_MESSAGE });
+        const authMsg = errorMessage || MISSING_API_KEY_MESSAGE;
+        set((state) => ({
+          alertMessage: authMsg,
+          chatNodeErrors: {
+            ...state.chatNodeErrors,
+            [chatNodeId]: authMsg,
+          },
+        }));
         return false;
       }
 
@@ -2098,6 +2294,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
           edges: nextEdges,
           nodeCounter: state.nodeCounter + 1,
           chatContextMap: computeChatContextMap(nextNodes, nextEdges),
+          chatNodeErrors: {
+            ...state.chatNodeErrors,
+            [chatNodeId]: errorMessage,
+          },
         };
       });
 

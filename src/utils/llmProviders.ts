@@ -87,13 +87,11 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
     endpointLabel: '/api/llm/generate (Gemini SDK)',
     endpointUrl: '/api/gemini/generate',
     consoleUrl: 'https://aistudio.google.com/apikey',
-    defaultModel: 'gemini-4-hydrogen',
+    defaultModel: 'gemini-2.5-flash',
     models: [
-      'gemini-4-hydrogen',
-      'gemini-4-argon',
-      'gemini-3.1-flash-lite',
       'gemini-2.5-flash',
       'gemini-2.5-pro',
+      'gemini-2.0-flash',
     ],
     keyPlaceholder: 'GEMINI_API_KEY (Server Secret)',
     supportsVision: true,
@@ -132,6 +130,25 @@ export const LLM_PROVIDERS: readonly LlmProviderMeta[] = [
     description: 'Server-proxied Mistral API with Pixtral multimodal vision models.',
   },
 ] as const;
+
+const LEGACY_GEMINI_MODELS = new Set([
+  'gemini-4-hydrogen',
+  'gemini-4-argon',
+  'gemini-3.1-flash-lite',
+]);
+
+export function normalizeProviderModel(
+  providerId: LlmProviderId,
+  model?: string | null,
+): string {
+  const meta = getProviderMeta(providerId);
+  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!trimmed) return meta.defaultModel;
+  if (providerId === 'google' && LEGACY_GEMINI_MODELS.has(trimmed)) {
+    return meta.defaultModel;
+  }
+  return trimmed;
+}
 
 export function getProviderMeta(providerId: LlmProviderId): LlmProviderMeta {
   const found = LLM_PROVIDERS.find((p) => p.id === providerId);
@@ -443,9 +460,10 @@ export function buildLlmProxyRequest(params: {
 }): LlmProxyRequestSpec {
   const globalSettings = readGlobalSettings();
   const resolvedProvider = params.provider ?? globalSettings.provider;
-  const meta = getProviderMeta(resolvedProvider);
-  const resolvedModel =
-    (params.model ?? globalSettings.model).trim() || meta.defaultModel;
+  const resolvedModel = normalizeProviderModel(
+    resolvedProvider,
+    params.model ?? globalSettings.model,
+  );
   const resolvedApiKey =
     params.apiKey?.trim() || getGlobalApiKey(resolvedProvider);
 
@@ -468,6 +486,8 @@ export function buildLlmProxyRequest(params: {
   };
 }
 
+const CLIENT_AI_TIMEOUT_MS = 35_000;
+
 /**
  * Executes a multimodal OSINT inspection request via the backend API proxy layer (`/api/llm/generate`).
  * Pulls the active provider, model, and API key from global localStorage settings.
@@ -482,12 +502,15 @@ export async function runMultiProviderAnalysis(params: {
   images: ParsedInlineImage[];
   systemPrompt?: string;
   fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }): Promise<string> {
   const globalSettings = readGlobalSettings();
   const provider = params.provider ?? globalSettings.provider;
   const meta = getProviderMeta(provider);
-  const model =
-    (params.model ?? globalSettings.model).trim() || meta.defaultModel;
+  const model = normalizeProviderModel(
+    provider,
+    params.model ?? globalSettings.model,
+  );
   const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
 
   const spec = buildLlmProxyRequest({
@@ -500,21 +523,60 @@ export async function runMultiProviderAnalysis(params: {
   });
 
   const fetchFn = params.fetchImpl ?? fetch;
-  const res = await fetchFn(spec.url, {
-    method: 'POST',
-    headers: spec.headers,
-    body: JSON.stringify(spec.body),
-  });
+  const timeoutMs = params.timeoutMs ?? CLIENT_AI_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const json = (await res.json().catch(() => null)) as {
+  let res: Response;
+  try {
+    res = await fetchFn(spec.url, {
+      method: 'POST',
+      headers: spec.headers,
+      body: JSON.stringify(spec.body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort) {
+      throw new Error(
+        `${meta.name} request timed out after ${Math.round(timeoutMs / 1000)}s. Check your network or API key.`,
+      );
+    }
+    throw new Error(
+      error instanceof Error
+        ? `Network error contacting backend: ${error.message}`
+        : 'Network error contacting backend.',
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const rawText = await res.text().catch(() => '');
+  let json: {
     text?: unknown;
     error?: unknown;
     message?: unknown;
     code?: unknown;
-  } | null;
+  } | null = null;
+  if (rawText) {
+    try {
+      json = JSON.parse(rawText) as {
+        text?: unknown;
+        error?: unknown;
+        message?: unknown;
+        code?: unknown;
+      };
+    } catch {
+      json = null;
+    }
+  }
 
   if (!res.ok) {
-    const errMsg = readApiErrorMessage(json, res.status);
+    const errMsg =
+      (json && readApiErrorMessage(json, res.status)) ||
+      (rawText.trim() && !rawText.trim().startsWith('<')
+        ? rawText.trim().slice(0, 300)
+        : `Provider request failed with HTTP ${res.status}.`);
     if (res.status === 401) {
       const code =
         json && typeof json.code === 'string' && json.code.trim()

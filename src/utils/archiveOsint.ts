@@ -126,11 +126,30 @@ export async function runArchiveCheck(params: {
   }
 
   const fetchFn = params.fetchImpl ?? fetch;
-  const response = await fetchFn(SERVER_ARCHIVE_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35_000);
+
+  let response: Response;
+  try {
+    response = await fetchFn(SERVER_ARCHIVE_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort) {
+      throw new Error('Wayback Machine lookup timed out after 35s.');
+    }
+    throw new Error(
+      error instanceof Error
+        ? `Network error contacting archive proxy: ${error.message}`
+        : 'Network error contacting archive proxy.',
+    );
+  } finally {
+    clearTimeout(timer);
+  }
 
   const payload = (await response.json().catch(() => null)) as
     | (Partial<ArchiveCheckResponse> & { error?: unknown; message?: unknown })

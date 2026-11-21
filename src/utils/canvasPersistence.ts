@@ -4,7 +4,8 @@ import type { OsintNode, OsintProject } from '../types/osint';
 
 export const OSINT_CANVAS_STORAGE_KEY = 'traceboard-osint-canvas-v1';
 export const OSINT_PROJECTS_STORAGE_KEY = 'traceboard-osint-projects-v2';
-export const CANVAS_SAVE_DEBOUNCE_MS = 400;
+export const OSINT_SYNC_BACKUP_STORAGE_KEY = 'traceboard-osint-sync-backup-v1';
+export const CANVAS_SAVE_DEBOUNCE_MS = 150;
 
 export interface PersistedCanvasState {
   version: 1;
@@ -75,19 +76,31 @@ export function serializeProjectsState(params: {
 }): PersistedProjectsState {
   const { projects, currentProjectId, savedAt = new Date().toISOString() } = params;
 
-  const cleanProjects: OsintProject[] = projects.map((project) => ({
-    id: project.id,
-    name: project.name.trim() || 'Untitled Project',
-    createdAt: project.createdAt,
-    nodes: sanitizeNodes(project.nodes),
-    edges: sanitizeEdges(project.edges),
-    nodeCounter:
-      typeof project.nodeCounter === 'number' &&
-      Number.isFinite(project.nodeCounter) &&
-      project.nodeCounter >= 1
-        ? project.nodeCounter
-        : Math.max(project.nodes.length + 1, 1),
-  }));
+  const cleanProjects: OsintProject[] = projects.map((project) => {
+    const cleanNodes = sanitizeNodes(project.nodes);
+    const cleanEdges = sanitizeEdges(project.edges);
+    return {
+      id: project.id,
+      name: project.name.trim() || 'Untitled Project',
+      createdAt: project.createdAt,
+      ...(project.updatedAt ? { updatedAt: project.updatedAt } : {}),
+      nodes: cleanNodes,
+      edges: cleanEdges,
+      nodeCounter:
+        typeof project.nodeCounter === 'number' &&
+        Number.isFinite(project.nodeCounter) &&
+        project.nodeCounter >= 1
+          ? project.nodeCounter
+          : Math.max(cleanNodes.length + 1, 1),
+      nodeCount: project.isSummaryOnly
+        ? (project.nodeCount ?? cleanNodes.length)
+        : cleanNodes.length,
+      edgeCount: project.isSummaryOnly
+        ? (project.edgeCount ?? cleanEdges.length)
+        : cleanEdges.length,
+      ...(project.isSummaryOnly ? { isSummaryOnly: true } : {}),
+    };
+  });
 
   const validCurrentId =
     currentProjectId && cleanProjects.some((p) => p.id === currentProjectId)
@@ -305,4 +318,98 @@ export async function loadProjectsFromIdb(): Promise<PersistedProjectsState | nu
 export async function clearProjectsInIdb(): Promise<void> {
   await del(OSINT_PROJECTS_STORAGE_KEY);
   await del(OSINT_CANVAS_STORAGE_KEY);
+  clearProjectsSyncBackup();
+}
+
+const MAX_SYNC_BACKUP_CHARS = 3_500_000;
+
+function getSafeBrowserStorage(): Storage | null {
+  try {
+    if (
+      typeof globalThis !== 'undefined' &&
+      'localStorage' in globalThis &&
+      globalThis.localStorage
+    ) {
+      return globalThis.localStorage;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+/**
+ * Synchronously writes a write-ahead snapshot to localStorage so rapid tab switches
+ * or page unloads never lose newly added nodes before async IndexedDB / network writes finish.
+ */
+export function saveProjectsSyncBackup(state: PersistedProjectsState): boolean {
+  const storage = getSafeBrowserStorage();
+  if (!storage) return false;
+  try {
+    const serialized = JSON.stringify(state);
+    if (serialized.length > MAX_SYNC_BACKUP_CHARS) {
+      return false;
+    }
+    storage.setItem(OSINT_SYNC_BACKUP_STORAGE_KEY, serialized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function loadProjectsSyncBackup(): PersistedProjectsState | null {
+  const storage = getSafeBrowserStorage();
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(OSINT_SYNC_BACKUP_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (isValidPersistedProjectsState(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Ignore corrupted backup
+  }
+  return null;
+}
+
+export function clearProjectsSyncBackup(): void {
+  const storage = getSafeBrowserStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(OSINT_SYNC_BACKUP_STORAGE_KEY);
+  } catch {
+    // Ignore
+  }
+}
+
+function parseTimestampMs(iso?: string): number {
+  if (!iso) return 0;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * Reconciles two copies of the same project (e.g. disk vs IndexedDB vs sync backup),
+ * ensuring a summary-only stub never overwrites a full graph and preferring the fresher
+ * `updatedAt` (or richer node/edge count when timestamps tie or are missing).
+ */
+export function pickFresherProject(
+  a: OsintProject | null | undefined,
+  b: OsintProject | null | undefined,
+): OsintProject | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+
+  if (a.isSummaryOnly && !b.isSummaryOnly) return b;
+  if (b.isSummaryOnly && !a.isSummaryOnly) return a;
+
+  const timeA = parseTimestampMs(a.updatedAt ?? a.createdAt);
+  const timeB = parseTimestampMs(b.updatedAt ?? b.createdAt);
+  if (timeA > timeB) return a;
+  if (timeB > timeA) return b;
+
+  const sizeA = a.nodes.length + a.edges.length;
+  const sizeB = b.nodes.length + b.edges.length;
+  return sizeB > sizeA ? b : a;
 }

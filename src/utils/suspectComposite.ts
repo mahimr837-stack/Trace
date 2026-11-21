@@ -306,19 +306,54 @@ export async function requestTargetImageGeneration(params: {
     images: params.images,
   });
 
-  const response = await fetchFn(spec.url, {
-    method: 'POST',
-    headers: spec.headers,
-    body: JSON.stringify(spec.body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35_000);
 
-  const payload = (await response.json().catch(() => null)) as {
+  let response: Response;
+  try {
+    response = await fetchFn(spec.url, {
+      method: 'POST',
+      headers: spec.headers,
+      body: JSON.stringify(spec.body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort) {
+      throw new Error(
+        'Target image generation timed out after 35s. Check your network or API key.',
+      );
+    }
+    throw new Error(
+      error instanceof Error
+        ? `Network error contacting image backend: ${error.message}`
+        : 'Network error contacting image backend.',
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const rawText = await response.text().catch(() => '');
+  let payload: {
     imageUrl?: unknown;
     model?: unknown;
     error?: unknown;
     message?: unknown;
     code?: unknown;
-  } | null;
+  } | null = null;
+  if (rawText) {
+    try {
+      payload = JSON.parse(rawText) as {
+        imageUrl?: unknown;
+        model?: unknown;
+        error?: unknown;
+        message?: unknown;
+        code?: unknown;
+      };
+    } catch {
+      payload = null;
+    }
+  }
 
   if (!response.ok) {
     const errMsg =
@@ -326,7 +361,9 @@ export async function requestTargetImageGeneration(params: {
       (payload &&
         typeof payload.message === 'string' &&
         payload.message.trim()) ||
-      `Target image generation failed with HTTP ${response.status}.`;
+      (rawText.trim() && !rawText.trim().startsWith('<')
+        ? rawText.trim().slice(0, 300)
+        : `Target image generation failed with HTTP ${response.status}.`);
     if (response.status === 401) {
       const code =
         payload && typeof payload.code === 'string' && payload.code.trim()

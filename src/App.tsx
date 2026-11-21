@@ -64,7 +64,11 @@ import { ArchiveNode } from './components/nodes/ArchiveNode';
 import { Dashboard } from './components/Dashboard';
 import { GlobalSettingsModal } from './components/GlobalSettingsModal';
 import { RedBezierEdge } from './components/edges/RedBezierEdge';
-import { flushPendingCanvasSave, useCanvasStore } from './store/useCanvasStore';
+import {
+  flushCanvasOnVisibilityHidden,
+  flushPendingCanvasSave,
+  useCanvasStore,
+} from './store/useCanvasStore';
 import {
   useMobileSync,
   type MobileSyncImagePayload,
@@ -825,20 +829,34 @@ export default function App() {
   }, [hydrateFromIndexedDb]);
 
   useEffect(() => {
-    const handleFlush = () => {
+    const handleUnloadFlush = () => {
       flushPendingCanvasSave();
     };
-    window.addEventListener('beforeunload', handleFlush);
-    window.addEventListener('pagehide', handleFlush);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushCanvasOnVisibilityHidden();
+      }
+    };
+    window.addEventListener('beforeunload', handleUnloadFlush);
+    window.addEventListener('pagehide', handleUnloadFlush);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
-      window.removeEventListener('beforeunload', handleFlush);
-      window.removeEventListener('pagehide', handleFlush);
+      window.removeEventListener('beforeunload', handleUnloadFlush);
+      window.removeEventListener('pagehide', handleUnloadFlush);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 
   const handleSelectProject = useCallback((selectedProjectId: string) => {
     setProjectId(selectedProjectId);
     setCurrentView('canvas');
+  }, []);
+
+  const handleBackToDashboard = useCallback(() => {
+    flushCanvasOnVisibilityHidden();
+    setCurrentView('dashboard');
   }, []);
 
   if (currentView === 'dashboard') {
@@ -849,7 +867,7 @@ export default function App() {
     <ReactFlowProvider>
       <OsintCanvas
         projectId={projectId ?? currentProjectId}
-        onBackToDashboard={() => setCurrentView('dashboard')}
+        onBackToDashboard={handleBackToDashboard}
       />
     </ReactFlowProvider>
   );

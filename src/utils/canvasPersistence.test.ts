@@ -199,3 +199,111 @@ test('createDebouncedTask coalesces rapid calls, flushes pending work, and respe
   assert.equal(debounced.hasPending(), false);
   assert.deepEqual(calls, ['c', 'e']);
 });
+
+test('sync backup and pickFresherProject preserve all nodes and prevent stale overwrites', async () => {
+  const {
+    clearProjectsSyncBackup,
+    loadProjectsSyncBackup,
+    pickFresherProject,
+    saveProjectsSyncBackup,
+  } = await import('./canvasPersistence');
+
+  const store = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      get length() {
+        return store.size;
+      },
+      clear() {
+        store.clear();
+      },
+      getItem(k: string) {
+        return store.has(k) ? store.get(k)! : null;
+      },
+      key(i: number) {
+        return Array.from(store.keys())[i] ?? null;
+      },
+      removeItem(k: string) {
+        store.delete(k);
+      },
+      setItem(k: string, v: string) {
+        store.set(k, String(v));
+      },
+    },
+    configurable: true,
+    writable: true,
+  });
+
+  const staleDiskProject: OsintProject = {
+    id: 'proj-nav',
+    name: 'Case Alpha',
+    createdAt: '2026-11-21T10:00:00.000Z',
+    updatedAt: '2026-11-21T10:01:00.000Z',
+    nodeCounter: 2,
+    nodes: [
+      {
+        id: 'img-1',
+        type: 'imageNode',
+        position: { x: 0, y: 0 },
+        data: { kind: 'image', title: 'Frame 1', imageUrl: null },
+      },
+    ],
+    edges: [],
+  };
+
+  const fresherLocalProject: OsintProject = {
+    ...staleDiskProject,
+    updatedAt: '2026-11-21T10:02:00.000Z',
+    nodeCounter: 4,
+    nodes: [
+      ...staleDiskProject.nodes,
+      {
+        id: 'chat-2',
+        type: 'chatNode',
+        position: { x: 320, y: 0 },
+        data: { kind: 'chat', title: 'Chat 2', messages: [] },
+      },
+      {
+        id: 'archive-3',
+        type: 'archiveNode',
+        position: { x: 640, y: 0 },
+        data: { kind: 'archive', title: 'Archive 3', urlInput: 'example.com', snapshots: [] },
+      },
+    ],
+    edges: [{ id: 'e-1', source: 'img-1', target: 'chat-2', type: 'redBezier' }],
+  };
+
+  const summaryStub: OsintProject = {
+    id: 'proj-nav',
+    name: 'Case Alpha',
+    createdAt: '2026-11-21T10:00:00.000Z',
+    updatedAt: '2026-11-21T10:05:00.000Z',
+    nodes: [],
+    edges: [],
+    nodeCount: 3,
+    edgeCount: 1,
+    isSummaryOnly: true,
+  };
+
+  const savedOk = saveProjectsSyncBackup(
+    serializeProjectsState({
+      projects: [fresherLocalProject],
+      currentProjectId: 'proj-nav',
+    }),
+  );
+  assert.equal(savedOk, true);
+
+  const restored = loadProjectsSyncBackup();
+  assert.ok(restored);
+  assert.equal(restored.projects[0]?.nodes.length, 3);
+  assert.equal(restored.projects[0]?.edges.length, 1);
+
+  // Fresher 3-node local graph beats older 1-node disk file and beats summary-only stub
+  const pickedVsDisk = pickFresherProject(staleDiskProject, restored.projects[0]);
+  assert.equal(pickedVsDisk?.nodes.length, 3);
+  const pickedVsSummary = pickFresherProject(summaryStub, restored.projects[0]);
+  assert.equal(pickedVsSummary?.nodes.length, 3);
+
+  clearProjectsSyncBackup();
+  assert.equal(loadProjectsSyncBackup(), null);
+});
