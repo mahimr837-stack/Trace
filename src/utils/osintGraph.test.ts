@@ -9,6 +9,7 @@ import {
   computeChatContextMap,
   computeDroppedNodePosition,
   computeNextResultPosition,
+  computeSpawnedCropNodePosition,
   computeSpawnedCroppedImagePosition,
   computeSpawnedImageFromVideoPosition,
   createOsintNode,
@@ -1640,4 +1641,77 @@ test('validates SuspectNode upstream context connections and downstream ImageNod
 
   const exportPayload = buildCaseExportPayload(nodes, []);
   assert.equal(exportPayload.summary.suspectCount, 1);
+});
+
+test('supports CropNode creation, right-hand placement, EXTRACTED FROM edge validation, and case export', () => {
+  assert.equal(isDeployableOsintNodeType('cropNode'), true);
+  assert.equal(DEPLOYABLE_NODE_TYPES.includes('cropNode'), true);
+
+  const parent = makeImageNode('img-source', 'Street Frame');
+  parent.position = { x: 100, y: 150 };
+
+  const pos0 = computeSpawnedCropNodePosition(parent, [parent]);
+  assert.deepEqual(pos0, { x: 480, y: 150 });
+
+  const crop0 = createOsintNode({
+    nodeType: 'cropNode',
+    index: 50,
+    existingNodes: [parent],
+    position: pos0,
+  });
+  assert.equal(crop0.type, 'cropNode');
+  assert.equal(crop0.data.kind, 'crop');
+  assert.equal(crop0.data.title, '');
+
+  const pos1 = computeSpawnedCropNodePosition(parent, [parent, crop0]);
+  assert.deepEqual(pos1, { x: 480, y: 410 });
+
+  const ocr = createOsintNode({
+    nodeType: 'ocrNode',
+    index: 51,
+    existingNodes: [parent, crop0],
+  });
+  const nodes = [parent, crop0, ocr];
+
+  assert.equal(
+    isValidOsintConnection(
+      {
+        source: parent.id,
+        target: crop0.id,
+        sourceHandle: HANDLE_IDS.IMAGE_RIGHT_OUT,
+        targetHandle: HANDLE_IDS.CROP_IN,
+      },
+      nodes,
+    ),
+    true,
+  );
+
+  assert.equal(
+    isValidOsintConnection(
+      {
+        source: crop0.id,
+        target: ocr.id,
+        sourceHandle: HANDLE_IDS.CROP_OUT,
+        targetHandle: HANDLE_IDS.OCR_IN,
+      },
+      nodes,
+    ),
+    true,
+  );
+
+  const edges: Edge[] = [
+    {
+      id: 'edge-extract-1',
+      source: parent.id,
+      target: crop0.id,
+      sourceHandle: HANDLE_IDS.IMAGE_RIGHT_OUT,
+      targetHandle: HANDLE_IDS.CROP_IN,
+      type: 'redBezier',
+      label: 'EXTRACTED FROM',
+    },
+  ];
+
+  const payload = buildCaseExportPayload(nodes, edges);
+  assert.equal(payload.summary.cropCount, 1);
+  assert.equal(payload.connections[0]?.label, 'EXTRACTED FROM');
 });

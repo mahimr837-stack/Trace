@@ -2,6 +2,7 @@ import type { Connection, Edge } from 'reactflow';
 import type { ExpandedTags } from 'exifreader';
 import type {
   ChatContextMap,
+  CropNodeData,
   DeployableOsintNodeType,
   EnhanceNodeData,
   ExifNodeData,
@@ -33,6 +34,7 @@ export const NODE_DRAG_MIME_TYPE = 'application/traceboard-node-type';
 
 export const DEPLOYABLE_NODE_TYPES: readonly DeployableOsintNodeType[] = [
   'imageNode',
+  'cropNode',
   'chatNode',
   'resultNode',
   'ocrNode',
@@ -135,6 +137,20 @@ export function createOsintNode(params: {
           imageUrl: null,
           sourceLabel: 'Unassigned',
         } satisfies ImageNodeData,
+      };
+    }
+    case 'cropNode': {
+      const count = existingNodes.filter((n) => n.type === 'cropNode').length;
+      const offset = (count % 4) * 28;
+      return {
+        id: `crop-${index}`,
+        type: 'cropNode',
+        position: explicitPosition ?? { x: 420, y: 170 + offset },
+        data: {
+          kind: 'crop',
+          title: '',
+          imageUrl: null,
+        } satisfies CropNodeData,
       };
     }
     case 'chatNode': {
@@ -435,6 +451,8 @@ export const HANDLE_IDS = {
   IMAGE_GROUP_IN: 'group-in',
   IMAGE_GROUP_OUT: 'group-out',
   IMAGE_RIGHT_OUT: 'image-out',
+  CROP_IN: 'crop-in',
+  CROP_OUT: 'crop-out',
   CHAT_GLOBAL_IN: 'global-context',
   CHAT_SPECIFIC_IN: 'specific-context',
   CHAT_RESULT_OUT: 'result-out',
@@ -489,7 +507,7 @@ function expandImageGroup(
 }
 
 /**
- * Computes for every ChatNode which ImageNodes, OcrNodes, ExifNodes, and EnhanceNodes
+ * Computes for every ChatNode which ImageNodes, CropNodes, OcrNodes, ExifNodes, and EnhanceNodes
  * are connected to its Global Context and Specific Context ports, including any
  * grouped ImageNodes chained via top/bottom handles.
  */
@@ -506,7 +524,12 @@ export function computeChatContextMap(
 
   for (const node of nodes) {
     nodeById.set(node.id, node);
-    if (node.type === 'imageNode' || node.data.kind === 'image') {
+    if (
+      node.type === 'imageNode' ||
+      node.data.kind === 'image' ||
+      node.type === 'cropNode' ||
+      node.data.kind === 'crop'
+    ) {
       validImageIds.add(node.id);
     } else if (node.type === 'ocrNode' || node.data.kind === 'ocr') {
       validOcrIds.add(node.id);
@@ -519,10 +542,22 @@ export function computeChatContextMap(
     }
   }
 
-  // Build undirected adjacency for grouped ImageNodes
+  // Build undirected adjacency for grouped ImageNodes (exclude CropNode extraction edges)
   const imageAdjacency = new Map<string, string[]>();
   for (const edge of edges) {
-    if (validImageIds.has(edge.source) && validImageIds.has(edge.target)) {
+    if (
+      edge.targetHandle === HANDLE_IDS.CROP_IN ||
+      edge.sourceHandle === HANDLE_IDS.CROP_OUT
+    ) {
+      continue;
+    }
+    const srcNode = nodeById.get(edge.source);
+    const tgtNode = nodeById.get(edge.target);
+    const srcIsStandardImage =
+      srcNode?.type === 'imageNode' || srcNode?.data.kind === 'image';
+    const tgtIsStandardImage =
+      tgtNode?.type === 'imageNode' || tgtNode?.data.kind === 'image';
+    if (srcIsStandardImage && tgtIsStandardImage) {
       const fromList = imageAdjacency.get(edge.source) ?? [];
       fromList.push(edge.target);
       imageAdjacency.set(edge.source, fromList);
@@ -640,6 +675,8 @@ export function isValidOsintConnection(
 
   const sourceIsImage = sourceNode.type === 'imageNode';
   const targetIsImage = targetNode.type === 'imageNode';
+  const sourceIsCrop = sourceNode.type === 'cropNode';
+  const targetIsCrop = targetNode.type === 'cropNode';
   const sourceIsChat = sourceNode.type === 'chatNode';
   const targetIsChat = targetNode.type === 'chatNode';
   const targetIsResult = targetNode.type === 'resultNode';
@@ -662,18 +699,35 @@ export function isValidOsintConnection(
   const targetIsShodan = targetNode.type === 'shodanNode';
   const targetIsArchive = targetNode.type === 'archiveNode';
 
-  // ImageNode / OcrNode / ChatNode / EnhanceNode -> SuspectNode (context inputs for composite generation)
+  // ImageNode -> CropNode (manual target extraction chain of custody)
+  if (sourceIsImage && targetIsCrop) {
+    const fromRightPort =
+      !connection.sourceHandle ||
+      connection.sourceHandle === HANDLE_IDS.IMAGE_RIGHT_OUT;
+    const toCropIn =
+      !connection.targetHandle ||
+      connection.targetHandle === HANDLE_IDS.CROP_IN;
+    return fromRightPort && toCropIn;
+  }
+
+  // ImageNode / CropNode / OcrNode / ChatNode / EnhanceNode -> SuspectNode (context inputs for composite generation)
   if (
-    (sourceIsImage || sourceIsOcr || sourceIsChat || sourceIsEnhance) &&
+    (sourceIsImage ||
+      sourceIsCrop ||
+      sourceIsOcr ||
+      sourceIsChat ||
+      sourceIsEnhance) &&
     targetIsSuspect
   ) {
     const expectedSourceHandle = sourceIsImage
       ? HANDLE_IDS.IMAGE_RIGHT_OUT
-      : sourceIsOcr
-        ? HANDLE_IDS.OCR_OUT
-        : sourceIsChat
-          ? HANDLE_IDS.CHAT_RESULT_OUT
-          : HANDLE_IDS.ENHANCE_OUT;
+      : sourceIsCrop
+        ? HANDLE_IDS.CROP_OUT
+        : sourceIsOcr
+          ? HANDLE_IDS.OCR_OUT
+          : sourceIsChat
+            ? HANDLE_IDS.CHAT_RESULT_OUT
+            : HANDLE_IDS.ENHANCE_OUT;
     const fromValidOut =
       !connection.sourceHandle ||
       connection.sourceHandle === expectedSourceHandle;
@@ -739,11 +793,14 @@ export function isValidOsintConnection(
     return validSource && validTarget;
   }
 
-  // ImageNode -> ChatNode context (right handle to left global/specific handles)
-  if (sourceIsImage && targetIsChat) {
+  // ImageNode / CropNode -> ChatNode context (right handle to left global/specific handles)
+  if ((sourceIsImage || sourceIsCrop) && targetIsChat) {
+    const expectedSourceHandle = sourceIsCrop
+      ? HANDLE_IDS.CROP_OUT
+      : HANDLE_IDS.IMAGE_RIGHT_OUT;
     const fromRightPort =
       !connection.sourceHandle ||
-      connection.sourceHandle === HANDLE_IDS.IMAGE_RIGHT_OUT;
+      connection.sourceHandle === expectedSourceHandle;
     const toChatPort =
       !connection.targetHandle ||
       connection.targetHandle === HANDLE_IDS.CHAT_GLOBAL_IN ||
@@ -751,9 +808,9 @@ export function isValidOsintConnection(
     return fromRightPort && toChatPort;
   }
 
-  // ImageNode -> OcrNode / ExifNode / EnhanceNode / ReverseSearchNode / FaceNode / ForensicsNode / GeoSpyNode / GeoIntelNode
+  // ImageNode / CropNode -> OcrNode / ExifNode / EnhanceNode / ReverseSearchNode / FaceNode / ForensicsNode / GeoSpyNode / GeoIntelNode
   if (
-    sourceIsImage &&
+    (sourceIsImage || sourceIsCrop) &&
     (targetIsOcr ||
       targetIsExif ||
       targetIsEnhance ||
@@ -763,9 +820,12 @@ export function isValidOsintConnection(
       targetIsGeoSpy ||
       targetIsGeoIntel)
   ) {
+    const expectedSourceHandle = sourceIsCrop
+      ? HANDLE_IDS.CROP_OUT
+      : HANDLE_IDS.IMAGE_RIGHT_OUT;
     const fromRightPort =
       !connection.sourceHandle ||
-      connection.sourceHandle === HANDLE_IDS.IMAGE_RIGHT_OUT;
+      connection.sourceHandle === expectedSourceHandle;
     const expectedTargetHandle = targetIsOcr
       ? HANDLE_IDS.OCR_IN
       : targetIsExif
@@ -1224,7 +1284,38 @@ export function computeSpawnedCroppedImagePosition(
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const collides = existingNodes.some(
       (node) =>
-        node.type === 'imageNode' &&
+        (node.type === 'imageNode' || node.type === 'cropNode') &&
+        Math.abs(node.position.x - targetX) <= 180 &&
+        Math.abs(node.position.y - candidateY) < minVerticalGap,
+    );
+    if (!collides) break;
+    candidateY += stepY;
+  }
+
+  return {
+    x: targetX,
+    y: candidateY,
+  };
+}
+
+/**
+ * Computes a clean position to the right (+380px) of a parent ImageNode
+ * when spawning an extracted CropNode, leaving room for the "EXTRACTED FROM" edge label.
+ */
+export function computeSpawnedCropNodePosition(
+  parentNode: OsintNode,
+  existingNodes: OsintNode[],
+): { x: number; y: number } {
+  const targetX = Math.round(parentNode.position.x + 380);
+  const baseY = Math.round(parentNode.position.y);
+  const stepY = 260;
+  const minVerticalGap = 240;
+
+  let candidateY = baseY;
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const collides = existingNodes.some(
+      (node) =>
+        (node.type === 'cropNode' || node.type === 'imageNode') &&
         Math.abs(node.position.x - targetX) <= 180 &&
         Math.abs(node.position.y - candidateY) < minVerticalGap,
     );
@@ -1246,8 +1337,7 @@ export interface ConnectedSourceImage {
 }
 
 /**
- * Resolves the connected source ImageNode (or EnhanceNode) feeding into a tool node
- * (OcrNode, ExifNode, or EnhanceNode).
+ * Resolves the connected source ImageNode, CropNode, EnhanceNode, or SuspectNode feeding into a tool node.
  */
 export function getConnectedSourceImageForNode(
   targetNodeId: string,
@@ -1266,6 +1356,15 @@ export function getConnectedSourceImageForNode(
       title: sourceNode.data.title || 'Untitled Image',
       imageUrl: sourceNode.data.imageUrl,
       sourceLabel: sourceNode.data.sourceLabel,
+    };
+  }
+
+  if (sourceNode.data.kind === 'crop') {
+    return {
+      id: sourceNode.id,
+      title: sourceNode.data.title || 'Extracted Target',
+      imageUrl: sourceNode.data.imageUrl,
+      sourceLabel: 'Extracted Target',
     };
   }
 
@@ -1763,6 +1862,7 @@ export interface OsintCaseExportPayload {
     nodeCount: number;
     connectionCount: number;
     imageCount: number;
+    cropCount: number;
     ocrCount: number;
     exifCount: number;
     enhanceCount: number;
@@ -1793,6 +1893,7 @@ export interface OsintCaseExportPayload {
     sourceHandle: string | null;
     targetHandle: string | null;
     type: string | null;
+    label: string | null;
   }>;
   extractedText: Array<{
     nodeId: string;
@@ -1829,6 +1930,7 @@ export function buildCaseExportPayload(
   const aiResponses: OsintCaseExportPayload['aiResponses'] = [];
 
   let imageCount = 0;
+  let cropCount = 0;
   let ocrCount = 0;
   let exifCount = 0;
   let enhanceCount = 0;
@@ -1849,6 +1951,8 @@ export function buildCaseExportPayload(
   for (const node of nodes) {
     if (node.data.kind === 'image') {
       imageCount += 1;
+    } else if (node.data.kind === 'crop') {
+      cropCount += 1;
     } else if (node.data.kind === 'ocr') {
       ocrCount += 1;
       extractedText.push({
@@ -1922,6 +2026,7 @@ export function buildCaseExportPayload(
       nodeCount: nodes.length,
       connectionCount: edges.length,
       imageCount,
+      cropCount,
       ocrCount,
       exifCount,
       enhanceCount,
@@ -1952,6 +2057,7 @@ export function buildCaseExportPayload(
       sourceHandle: edge.sourceHandle ?? null,
       targetHandle: edge.targetHandle ?? null,
       type: edge.type ?? null,
+      label: typeof edge.label === 'string' ? edge.label : null,
     })),
     extractedText,
     exifData,

@@ -18,6 +18,7 @@ export function RedBezierEdge({
   targetPosition,
   selected,
   markerEnd,
+  label,
 }: EdgeProps) {
   const [hovered, setHovered] = useState(false);
   const deleteEdge = useCanvasStore((state) => state.deleteEdge);
@@ -33,6 +34,7 @@ export function RedBezierEdge({
   });
 
   const active = hovered || selected;
+  const hasLabel = Boolean(label);
 
   return (
     <g
@@ -61,26 +63,38 @@ export function RedBezierEdge({
         }}
       />
       <EdgeLabelRenderer>
-        {active && (
+        {(hasLabel || active) && (
           <div
             style={{
               position: 'absolute',
               transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)`,
               pointerEvents: 'all',
             }}
-            className="nodrag nopan"
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => setHovered(false)}
+            className="nodrag nopan flex items-center gap-1"
           >
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                deleteEdge(id);
-              }}
-              aria-label={`Disconnect wire ${id}`}
-              className="flex h-6 w-6 items-center justify-center rounded-full border border-[#ff4d4d]/40 bg-white text-[#ff4d4d] shadow-sm transition-colors hover:bg-[#ff4d4d] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#ff4d4d]"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
+            {hasLabel && (
+              <span
+                data-testid={`edge-label-${id}`}
+                className="select-none rounded-full border border-[#ff4d4d]/35 bg-white/95 px-2 py-0.5 font-mono text-[9px] font-semibold tracking-wider text-[#ff4d4d] uppercase shadow-xs backdrop-blur-xs"
+              >
+                {label}
+              </span>
+            )}
+            {active && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deleteEdge(id);
+                }}
+                aria-label={`Disconnect wire ${id}`}
+                className="flex h-5 w-5 items-center justify-center rounded-full border border-[#ff4d4d]/40 bg-white text-[#ff4d4d] shadow-sm transition-colors hover:bg-[#ff4d4d] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#ff4d4d]"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
           </div>
         )}
       </EdgeLabelRenderer>

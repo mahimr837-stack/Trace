@@ -20,6 +20,7 @@ export interface NodeDimensions {
 
 const DEFAULT_DIMENSIONS_BY_TYPE: Record<string, NodeDimensions> = {
   imageNode: { width: 288, height: 280 },
+  cropNode: { width: 240, height: 240 },
   chatNode: { width: 420, height: 420 },
   resultNode: { width: 352, height: 390 },
   ocrNode: { width: 320, height: 290 },

@@ -20,6 +20,7 @@ import type {
   ChatContextMap,
   ChatMessage,
   ChatNodeData,
+  CropNodeData,
   DeployableOsintNodeType,
   EnhanceNodeData,
   EnhanceScale,
@@ -47,7 +48,7 @@ import {
   buildOsintPromptText,
   computeChatContextMap,
   computeNextResultPosition,
-  computeSpawnedCroppedImagePosition,
+  computeSpawnedCropNodePosition,
   computeSpawnedImageFromVideoPosition,
   type ConnectedExifPromptContext,
   type ConnectedOcrPromptContext,
@@ -60,7 +61,6 @@ import {
   resolveArchiveSourceForNode,
   resolveDorkSourceForNode,
 } from '../utils/osintGraph';
-import { formatCroppedNodeTitle } from '../utils/imageCrop';
 import { buildVideoFrameTitle } from '../utils/videoFramesHelpers';
 import { generateGoogleDorks } from '../utils/dorkGenerator';
 import {
@@ -482,6 +482,7 @@ interface CanvasState {
   addSuspectNode: (position?: { x: number; y: number }) => void;
   updateImageNodeTitle: (nodeId: string, title: string) => void;
   updateImageNodeImage: (nodeId: string, imageUrl: string | null, sourceLabel?: string) => void;
+  updateCropNodeTitle: (nodeId: string, title: string) => void;
   updateChatNodeTitle: (nodeId: string, title: string) => void;
   updateChatNodeDraftPrompt: (nodeId: string, draftPrompt: string) => void;
   updateOcrNodeData: (nodeId: string, patch: Partial<OcrNodeData>) => void;
@@ -505,6 +506,10 @@ interface CanvasState {
     videoNodeId: string,
     frame: VideoExtractedFrame,
   ) => string | null;
+  spawnCropNode: (params: {
+    parentNodeId: string;
+    croppedImageUrl: string;
+  }) => string | null;
   spawnCroppedImageNode: (params: {
     parentNodeId: string;
     croppedImageUrl: string;
@@ -1417,6 +1422,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     }));
   },
 
+  updateCropNodeTitle: (nodeId, title) => {
+    set((state) => ({
+      nodes: state.nodes.map((node) => {
+        if (node.id !== nodeId || node.data.kind !== 'crop') return node;
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            title,
+          } satisfies CropNodeData,
+        };
+      }),
+    }));
+  },
+
   updateChatNodeTitle: (nodeId, title) => {
     set((state) => ({
       nodes: state.nodes.map((node) => {
@@ -1792,45 +1812,43 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     return createdId;
   },
 
-  spawnCroppedImageNode: ({ parentNodeId, croppedImageUrl, dimensionsLabel }) => {
+  spawnCropNode: ({ parentNodeId, croppedImageUrl }) => {
     let createdId: string | null = null;
     set((state) => {
       const parentNode = state.nodes.find((n) => n.id === parentNodeId);
       if (!parentNode || parentNode.data.kind !== 'image') return state;
 
       const index = state.nodeCounter;
-      const newImageId = `img-${index}`;
-      createdId = newImageId;
+      const newCropId = `crop-${index}`;
+      createdId = newCropId;
 
-      const position = computeSpawnedCroppedImagePosition(
+      const position = computeSpawnedCropNodePosition(
         parentNode,
         state.nodes,
       );
-      const parentTitle = parentNode.data.title || 'Untitled Image';
 
-      const croppedNode: OsintNode = {
-        id: newImageId,
-        type: 'imageNode',
+      const cropNode: OsintNode = {
+        id: newCropId,
+        type: 'cropNode',
         position,
         data: {
-          kind: 'image',
-          title: formatCroppedNodeTitle(parentTitle),
+          kind: 'crop',
+          title: '',
           imageUrl: croppedImageUrl,
-          sourceLabel: `Cropped from ${parentTitle}`,
-          dimensions: dimensionsLabel,
-        } satisfies ImageNodeData,
+        } satisfies CropNodeData,
       };
 
       const cropEdge: Edge = {
-        id: `edge-crop-${parentNodeId}-${newImageId}-${Date.now()}`,
+        id: `edge-crop-${parentNodeId}-${newCropId}-${Date.now()}`,
         source: parentNodeId,
-        target: newImageId,
+        target: newCropId,
         sourceHandle: HANDLE_IDS.IMAGE_RIGHT_OUT,
-        targetHandle: HANDLE_IDS.IMAGE_LEFT_IN,
+        targetHandle: HANDLE_IDS.CROP_IN,
         type: 'redBezier',
+        label: 'EXTRACTED FROM',
       };
 
-      const nextNodes = [...state.nodes, croppedNode];
+      const nextNodes = [...state.nodes, cropNode];
       const nextEdges = [...state.edges, cropEdge];
       return {
         nodes: nextNodes,
@@ -1840,6 +1858,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       };
     });
     return createdId;
+  },
+
+  spawnCroppedImageNode: ({ parentNodeId, croppedImageUrl }) => {
+    return get().spawnCropNode({ parentNodeId, croppedImageUrl });
   },
 
   injectMobileImage: ({ targetId, imageBase64, position, title }) => {
@@ -1970,6 +1992,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     for (const node of initialState.nodes) {
       if (node.data.kind === 'image') {
         imageNodesById.set(node.id, node.data);
+      } else if (node.data.kind === 'crop') {
+        imageNodesById.set(node.id, {
+          kind: 'image',
+          title: node.data.title || 'Extracted Target',
+          imageUrl: node.data.imageUrl,
+        });
       } else if (node.data.kind === 'ocr') {
         ocrNodesById.set(node.id, node.data);
       } else if (node.data.kind === 'exif') {

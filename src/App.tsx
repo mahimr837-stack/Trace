@@ -43,6 +43,7 @@ import {
   X,
 } from 'lucide-react';
 import { ImageNode } from './components/nodes/ImageNode';
+import { CropNode } from './components/nodes/CropNode';
 import { ChatNode } from './components/nodes/ChatNode';
 import { ResultNode } from './components/nodes/ResultNode';
 import { OcrNode } from './components/nodes/OcrNode';
@@ -85,6 +86,7 @@ import {
 
 const nodeTypes: NodeTypes = {
   imageNode: ImageNode,
+  cropNode: CropNode,
   chatNode: ChatNode,
   resultNode: ResultNode,
   ocrNode: OcrNode,
@@ -763,6 +765,7 @@ function OsintCanvas({ projectId, onBackToDashboard }: OsintCanvasProps) {
           zoomable
           nodeColor={(node) => {
             if (node.type === 'chatNode') return '#ff4d4d';
+            if (node.type === 'cropNode') return '#fb7185';
             if (node.type === 'resultNode') return '#171717';
             if (
               node.type === 'ocrNode' ||

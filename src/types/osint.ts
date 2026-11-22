@@ -28,6 +28,12 @@ export interface ImageNodeData {
   dimensions?: string;
 }
 
+export interface CropNodeData {
+  kind: 'crop';
+  title: string;
+  imageUrl: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -208,6 +214,7 @@ export interface ArchiveNodeData {
 
 export type OsintNodeData =
   | ImageNodeData
+  | CropNodeData
   | ChatNodeData
   | ResultNodeData
   | OcrNodeData
@@ -230,6 +237,7 @@ export type OsintNode = Node<OsintNodeData>;
 
 export type DeployableOsintNodeType =
   | 'imageNode'
+  | 'cropNode'
   | 'chatNode'
   | 'resultNode'
   | 'ocrNode'

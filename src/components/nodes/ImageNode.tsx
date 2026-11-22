@@ -6,6 +6,7 @@ import {
   type ChangeEvent,
   type DragEvent,
   type MouseEvent,
+  type TouchEvent,
 } from 'react';
 import { Handle, Position, type NodeProps } from 'reactflow';
 import { Crop, Image as ImageIcon, Upload } from 'lucide-react';
@@ -26,9 +27,7 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
   const updateImageNodeImage = useCanvasStore(
     (state) => state.updateImageNodeImage,
   );
-  const spawnCroppedImageNode = useCanvasStore(
-    (state) => state.spawnCroppedImageNode,
-  );
+  const spawnCropNode = useCanvasStore((state) => state.spawnCropNode);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
@@ -194,17 +193,16 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
         );
 
         const croppedDataUrl = canvas.toDataURL('image/png');
-        spawnCroppedImageNode({
+        spawnCropNode({
           parentNodeId: id,
           croppedImageUrl: croppedDataUrl,
-          dimensionsLabel: `${sourceRect.sWidth} × ${sourceRect.sHeight}`,
         });
       } finally {
         setIsCropping(false);
         setSelectionRect(null);
       }
     },
-    [getOverlayPointFromClient, id, selectionRect, spawnCroppedImageNode],
+    [getOverlayPointFromClient, id, selectionRect, spawnCropNode],
   );
 
   useEffect(() => {
@@ -229,11 +227,39 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
       completeCropAtClientPoint(event.clientX, event.clientY);
     };
 
+    const handleWindowTouchMove = (event: globalThis.TouchEvent) => {
+      const activeStart = dragStartRef.current;
+      const touch = event.touches[0];
+      if (!activeStart || !touch) return;
+      const info = getOverlayPointFromClient(touch.clientX, touch.clientY);
+      if (!info) return;
+      setSelectionRect(
+        normalizeSelectionRect(
+          activeStart,
+          info.point,
+          info.width,
+          info.height,
+        ),
+      );
+    };
+
+    const handleWindowTouchEnd = (event: globalThis.TouchEvent) => {
+      const touch = event.changedTouches[0];
+      if (!touch) return;
+      completeCropAtClientPoint(touch.clientX, touch.clientY);
+    };
+
     window.addEventListener('mousemove', handleWindowMouseMove);
     window.addEventListener('mouseup', handleWindowMouseUp);
+    window.addEventListener('touchmove', handleWindowTouchMove, {
+      passive: true,
+    });
+    window.addEventListener('touchend', handleWindowTouchEnd);
     return () => {
       window.removeEventListener('mousemove', handleWindowMouseMove);
       window.removeEventListener('mouseup', handleWindowMouseUp);
+      window.removeEventListener('touchmove', handleWindowTouchMove);
+      window.removeEventListener('touchend', handleWindowTouchEnd);
     };
   }, [completeCropAtClientPoint, dragStart, getOverlayPointFromClient]);
 
@@ -270,6 +296,29 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
     event.preventDefault();
     event.stopPropagation();
     completeCropAtClientPoint(event.clientX, event.clientY);
+  };
+
+  const handleCropTouchStart = (event: TouchEvent<SVGSVGElement>) => {
+    const touch = event.touches[0];
+    if (!touch) return;
+    event.stopPropagation();
+    const info = getOverlayPointFromClient(touch.clientX, touch.clientY);
+    if (!info) return;
+    dragStartRef.current = info.point;
+    setDragStart(info.point);
+    setSelectionRect({
+      x: info.point.x,
+      y: info.point.y,
+      width: 0,
+      height: 0,
+    });
+  };
+
+  const handleCropTouchEnd = (event: TouchEvent<SVGSVGElement>) => {
+    const touch = event.changedTouches[0];
+    if (!dragStartRef.current || !touch) return;
+    event.stopPropagation();
+    completeCropAtClientPoint(touch.clientX, touch.clientY);
   };
 
   return (
@@ -314,7 +363,7 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
             title={
               isCropping
                 ? 'Cancel crop selection (Esc)'
-                : 'Crop region into new ImageNode'
+                : 'Extract target region into new CropNode'
             }
             aria-label={
               isCropping
@@ -404,7 +453,9 @@ export function ImageNode({ id, data, selected }: NodeProps<ImageNodeData>) {
                     onMouseDown={handleCropMouseDown}
                     onMouseMove={handleCropMouseMove}
                     onMouseUp={finalizeCrop}
-                    className="nodrag nopan absolute inset-0 z-10 h-full w-full cursor-crosshair select-none"
+                    onTouchStart={handleCropTouchStart}
+                    onTouchEnd={handleCropTouchEnd}
+                    className="nodrag nopan touch-none absolute inset-0 z-10 h-full w-full cursor-crosshair select-none"
                   >
                     <defs>
                       <mask id={`crop-mask-${id}`}>
