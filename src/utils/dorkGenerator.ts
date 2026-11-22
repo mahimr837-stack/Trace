@@ -83,6 +83,8 @@ export async function generateGoogleDorks(params: {
   provider?: LlmProviderId;
   model?: string;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: 'openai' | 'anthropic';
   fetchImpl?: typeof fetch;
 }): Promise<string[]> {
   const globalSettings = readGlobalSettings();
@@ -91,6 +93,10 @@ export async function generateGoogleDorks(params: {
   const model =
     (params.model ?? globalSettings.model).trim() || meta.defaultModel;
   const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
+  const resolvedBaseUrl = params.baseUrl ?? (globalSettings.baseUrl || undefined);
+  const resolvedProviderType =
+    params.providerType ??
+    (resolvedBaseUrl ? globalSettings.providerType : undefined);
 
   const userPrompt = buildDorkUserPrompt(
     params.targetType,
@@ -101,6 +107,8 @@ export async function generateGoogleDorks(params: {
     provider,
     apiKey: resolvedApiKey || undefined,
     model,
+    baseUrl: resolvedBaseUrl,
+    providerType: resolvedProviderType,
     systemPrompt: DORK_SYSTEM_PROMPT,
     promptText: userPrompt,
     images: [],

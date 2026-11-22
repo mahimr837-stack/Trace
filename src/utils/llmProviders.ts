@@ -1,10 +1,14 @@
 import type { ParsedInlineImage } from './osintGraph';
 import {
   ApiAuthError,
+  getActiveCustomProvider,
   getGlobalApiKey,
   MISSING_API_KEY_CODE,
   MISSING_API_KEY_MESSAGE,
+  normalizeBaseUrl,
   readGlobalSettings,
+  type AvailableModelOption,
+  type CustomProviderType,
 } from './globalSettings';
 
 export type LlmProviderId =
@@ -209,8 +213,107 @@ export interface OpenAiCompatibleRequestSpec {
 }
 
 /**
- * Builds an upstream OpenAI-compatible Chat Completions request for OpenAI, OpenRouter, DeepSeek, or Mistral.
- * Executed on the backend proxy server using server-side environment variable credentials.
+ * Resolves the Chat Completions endpoint URL from a custom OpenAI-compatible baseUrl.
+ */
+export function resolveOpenAiChatCompletionsUrl(baseUrl: string): string {
+  const clean = normalizeBaseUrl(baseUrl);
+  if (/\/chat\/completions$/i.test(clean)) return clean;
+  return `${clean}/chat/completions`;
+}
+
+/**
+ * Resolves the Anthropic Messages endpoint URL from a custom Anthropic baseUrl.
+ */
+export function resolveAnthropicMessagesUrl(baseUrl: string): string {
+  const clean = normalizeBaseUrl(baseUrl);
+  if (/\/messages$/i.test(clean)) return clean;
+  if (/\/v1$/i.test(clean)) return `${clean}/messages`;
+  return `${clean}/v1/messages`;
+}
+
+/**
+ * Resolves the `/models` discovery endpoint URL from a custom provider baseUrl.
+ */
+export function resolveModelsEndpointUrl(
+  baseUrl: string,
+  providerType: CustomProviderType = 'openai',
+): string {
+  let clean = normalizeBaseUrl(baseUrl);
+  clean = clean
+    .replace(/\/chat\/completions$/i, '')
+    .replace(/\/messages$/i, '')
+    .replace(/\/models$/i, '');
+  if (providerType === 'anthropic' && !/\/v1$/i.test(clean)) {
+    return `${clean}/v1/models`;
+  }
+  return `${clean}/models`;
+}
+
+/**
+ * Normalizes model listing responses from OpenAI, OpenRouter, Anthropic, Ollama,
+ * Groq, Together, LM Studio, and other compatible providers into `{ id, name }[]`.
+ */
+export function parseAvailableModelsResponse(
+  payload: unknown,
+): AvailableModelOption[] {
+  const rawList: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload &&
+        typeof payload === 'object' &&
+        Array.isArray((payload as { data?: unknown }).data)
+      ? ((payload as { data: unknown[] }).data ?? [])
+      : payload &&
+          typeof payload === 'object' &&
+          Array.isArray((payload as { models?: unknown }).models)
+        ? ((payload as { models: unknown[] }).models ?? [])
+        : [];
+
+  const seen = new Set<string>();
+  const models: AvailableModelOption[] = [];
+
+  for (const item of rawList) {
+    if (typeof item === 'string' && item.trim()) {
+      const id = item.trim();
+      if (!seen.has(id)) {
+        seen.add(id);
+        models.push({ id, name: id });
+      }
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as {
+      id?: unknown;
+      name?: unknown;
+      display_name?: unknown;
+      model?: unknown;
+    };
+    const rawId =
+      typeof rec.id === 'string' && rec.id.trim()
+        ? rec.id.trim()
+        : typeof rec.model === 'string' && rec.model.trim()
+          ? rec.model.trim()
+          : typeof rec.name === 'string' && rec.name.trim()
+            ? rec.name.trim()
+            : '';
+    if (!rawId || seen.has(rawId)) continue;
+    seen.add(rawId);
+
+    const rawName =
+      typeof rec.name === 'string' && rec.name.trim()
+        ? rec.name.trim()
+        : typeof rec.display_name === 'string' && rec.display_name.trim()
+          ? rec.display_name.trim()
+          : rawId;
+
+    models.push({ id: rawId, name: rawName });
+  }
+
+  return models.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Builds an upstream OpenAI-compatible Chat Completions request for OpenAI, OpenRouter,
+ * DeepSeek, Mistral, or any custom OpenAI-compatible provider baseUrl (e.g., Ollama, LM Studio, Groq).
  */
 export function buildOpenAiCompatibleRequest(params: {
   provider: 'openai' | 'openrouter' | 'deepseek' | 'mistral';
@@ -220,25 +323,41 @@ export function buildOpenAiCompatibleRequest(params: {
   images: ParsedInlineImage[];
   systemPrompt?: string;
   origin?: string;
+  baseUrl?: string;
 }): OpenAiCompatibleRequestSpec {
-  const { provider, apiKey, model, promptText, images, systemPrompt, origin } = params;
+  const {
+    provider,
+    apiKey,
+    model,
+    promptText,
+    images,
+    systemPrompt,
+    origin,
+    baseUrl,
+  } = params;
   const meta = getProviderMeta(provider);
-  const url = meta.endpointUrl!;
+  const url = baseUrl?.trim()
+    ? resolveOpenAiChatCompletionsUrl(baseUrl)
+    : meta.endpointUrl!;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey.trim()}`,
   };
+  if (apiKey.trim()) {
+    headers.Authorization = `Bearer ${apiKey.trim()}`;
+  }
 
-  if (provider === 'openrouter') {
+  if (provider === 'openrouter' || url.toLowerCase().includes('openrouter.ai')) {
     if (origin) {
       headers['HTTP-Referer'] = origin;
     }
     headers['X-Title'] = 'Traceboard Image OSINT Canvas';
   }
 
+  const supportsVision = baseUrl?.trim() ? true : meta.supportsVision;
+
   let content: string | OpenAiContentPart[];
-  if (images.length > 0 && meta.supportsVision) {
+  if (images.length > 0 && supportsVision) {
     content = [
       { type: 'text', text: promptText },
       ...images.map((img) => ({
@@ -248,7 +367,7 @@ export function buildOpenAiCompatibleRequest(params: {
         },
       })),
     ];
-  } else if (images.length > 0 && !meta.supportsVision) {
+  } else if (images.length > 0 && !supportsVision) {
     content =
       `${promptText}\n\n` +
       `[Attachment note: ${images.length} image frame(s) were wired, but ${meta.name} text models inspect text, OCR, and EXIF metadata context rather than raw pixels.]`;
@@ -307,8 +426,7 @@ export interface AnthropicRequestSpec {
 }
 
 /**
- * Builds an upstream Anthropic Messages API multimodal request.
- * Executed on the backend proxy server using server-side environment variable credentials.
+ * Builds an upstream Anthropic Messages API multimodal request (supports custom baseUrl).
  */
 export function buildAnthropicRequest(params: {
   apiKey: string;
@@ -316,9 +434,13 @@ export function buildAnthropicRequest(params: {
   promptText: string;
   images: ParsedInlineImage[];
   systemPrompt?: string;
+  baseUrl?: string;
 }): AnthropicRequestSpec {
-  const { apiKey, model, promptText, images, systemPrompt } = params;
+  const { apiKey, model, promptText, images, systemPrompt, baseUrl } = params;
   const meta = getProviderMeta('anthropic');
+  const url = baseUrl?.trim()
+    ? resolveAnthropicMessagesUrl(baseUrl)
+    : meta.endpointUrl!;
 
   const content: AnthropicContentPart[] = [
     ...images.map((img) => ({
@@ -351,7 +473,7 @@ export function buildAnthropicRequest(params: {
   }
 
   return {
-    url: meta.endpointUrl!,
+    url,
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': apiKey.trim(),
@@ -478,31 +600,51 @@ export interface LlmProxyRequestSpec {
     images: ParsedInlineImage[];
     systemPrompt?: string;
     apiKey?: string;
+    baseUrl?: string;
+    providerType?: CustomProviderType;
   };
 }
 
 /**
- * Builds a unified server-side LLM proxy request payload for any provider
- * (Google Gemini, Anthropic, OpenAI, OpenRouter, DeepSeek, or Mistral).
- * Pulls the global API key from localStorage when available and forwards it
- * via both the `x-api-key` header and JSON body.
+ * Builds a unified server-side LLM proxy request payload.
+ * Pulls `baseUrl`, `apiKey`, `providerType`, and `model` from the selected custom provider
+ * (or falls back to global legacy provider settings) and forwards the API key via both
+ * the `x-api-key` header and JSON body.
  */
 export function buildLlmProxyRequest(params: {
   provider?: LlmProviderId;
   apiKey?: string;
   model?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
   promptText: string;
   images: ParsedInlineImage[];
   systemPrompt?: string;
 }): LlmProxyRequestSpec {
   const globalSettings = readGlobalSettings();
+  const activeCustom = getActiveCustomProvider(globalSettings);
+
+  const resolvedBaseUrl =
+    params.baseUrl !== undefined
+      ? normalizeBaseUrl(params.baseUrl)
+      : activeCustom?.baseUrl || globalSettings.baseUrl || '';
+  const resolvedProviderType: CustomProviderType | undefined =
+    params.providerType ??
+    (resolvedBaseUrl
+      ? activeCustom?.providerType || globalSettings.providerType || 'openai'
+      : undefined);
+
   const resolvedProvider = params.provider ?? globalSettings.provider;
-  const resolvedModel = normalizeProviderModel(
-    resolvedProvider,
-    params.model ?? globalSettings.model,
-  );
+  const rawModel =
+    params.model ?? activeCustom?.model ?? globalSettings.model ?? '';
+  const resolvedModel = resolvedBaseUrl
+    ? rawModel.trim() || getProviderMeta(resolvedProvider).defaultModel
+    : normalizeProviderModel(resolvedProvider, rawModel);
+
   const resolvedApiKey =
-    params.apiKey?.trim() || getGlobalApiKey(resolvedProvider);
+    params.apiKey?.trim() ||
+    (resolvedBaseUrl ? activeCustom?.apiKey?.trim() || '' : '') ||
+    getGlobalApiKey(resolvedProvider);
 
   return {
     url: '/api/llm/generate',
@@ -519,6 +661,10 @@ export function buildLlmProxyRequest(params: {
         ? { systemPrompt: params.systemPrompt.trim() }
         : {}),
       ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
+      ...(resolvedBaseUrl ? { baseUrl: resolvedBaseUrl } : {}),
+      ...(resolvedBaseUrl && resolvedProviderType
+        ? { providerType: resolvedProviderType }
+        : {}),
     },
   };
 }
@@ -526,15 +672,94 @@ export function buildLlmProxyRequest(params: {
 const CLIENT_AI_TIMEOUT_MS = 60_000;
 
 /**
+ * Fetches available models from a custom provider via the backend `/api/providers/models` proxy.
+ */
+export async function fetchProviderModels(params: {
+  baseUrl: string;
+  apiKey: string;
+  providerType: CustomProviderType;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<AvailableModelOption[]> {
+  const cleanBaseUrl = normalizeBaseUrl(params.baseUrl);
+  if (!cleanBaseUrl) {
+    throw new Error('Base URL is required to fetch models.');
+  }
+
+  const fetchFn = params.fetchImpl ?? fetch;
+  const timeoutMs = params.timeoutMs ?? 20_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetchFn('/api/providers/models', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(params.apiKey.trim() ? { 'x-api-key': params.apiKey.trim() } : {}),
+      },
+      body: JSON.stringify({
+        baseUrl: cleanBaseUrl,
+        apiKey: params.apiKey.trim(),
+        providerType: params.providerType,
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort) {
+      throw new Error(
+        `Model list request timed out after ${Math.round(timeoutMs / 1000)}s.`,
+      );
+    }
+    throw new Error(
+      error instanceof Error
+        ? `Network error fetching models: ${error.message}`
+        : 'Network error fetching models.',
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const rawText = await res.text().catch(() => '');
+  let json: {
+    models?: unknown;
+    error?: unknown;
+    message?: unknown;
+  } | null = null;
+  if (rawText) {
+    try {
+      json = JSON.parse(rawText) as {
+        models?: unknown;
+        error?: unknown;
+        message?: unknown;
+      };
+    } catch {
+      json = null;
+    }
+  }
+
+  if (!res.ok) {
+    const errMsg =
+      (json && readApiErrorMessage(json, res.status)) ||
+      `Failed to fetch models (HTTP ${res.status}).`;
+    throw new Error(errMsg);
+  }
+
+  return parseAvailableModelsResponse(json?.models ?? json);
+}
+
+/**
  * Executes a multimodal OSINT inspection request via the backend API proxy layer (`/api/llm/generate`).
- * Pulls the active provider, model, and API key from global localStorage settings.
- * If no client key is configured, the request is still sent so the server can fall back to `.env`,
- * or return HTTP 401 so the UI can prompt the user to configure Settings.
+ * Pulls the active custom provider (`baseUrl`, `apiKey`, `providerType`, `model`) from global localStorage settings.
  */
 export async function runMultiProviderAnalysis(params: {
   provider?: LlmProviderId;
   apiKey?: string;
   model?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
   promptText: string;
   images: ParsedInlineImage[];
   systemPrompt?: string;
@@ -542,15 +767,35 @@ export async function runMultiProviderAnalysis(params: {
   timeoutMs?: number;
 }): Promise<string> {
   const globalSettings = readGlobalSettings();
+  const activeCustom = getActiveCustomProvider(globalSettings);
   const provider = params.provider ?? globalSettings.provider;
   const meta = getProviderMeta(provider);
-  const model = normalizeProviderModel(
-    provider,
-    params.model ?? globalSettings.model,
-  );
-  const resolvedApiKey = params.apiKey?.trim() || getGlobalApiKey(provider);
+  const resolvedBaseUrl =
+    params.baseUrl !== undefined
+      ? normalizeBaseUrl(params.baseUrl)
+      : activeCustom?.baseUrl || globalSettings.baseUrl || '';
+  const resolvedProviderType: CustomProviderType | undefined =
+    params.providerType ??
+    (resolvedBaseUrl
+      ? activeCustom?.providerType || globalSettings.providerType || 'openai'
+      : undefined);
 
-  if (params.images.length > 0 && !isVisionCapableModel(provider, model)) {
+  const rawModel =
+    params.model ?? activeCustom?.model ?? globalSettings.model ?? '';
+  const model = resolvedBaseUrl
+    ? rawModel.trim() || meta.defaultModel
+    : normalizeProviderModel(provider, rawModel);
+  const resolvedApiKey =
+    params.apiKey?.trim() ||
+    (resolvedBaseUrl ? activeCustom?.apiKey?.trim() || '' : '') ||
+    getGlobalApiKey(provider);
+
+  const displayName = activeCustom?.name || meta.name;
+
+  if (
+    params.images.length > 0 &&
+    !isVisionCapableModel(resolvedBaseUrl ? 'openai' : provider, model)
+  ) {
     throw new Error(NON_VISION_MODEL_WARNING);
   }
 
@@ -558,6 +803,8 @@ export async function runMultiProviderAnalysis(params: {
     provider,
     apiKey: resolvedApiKey || undefined,
     model,
+    baseUrl: resolvedBaseUrl || undefined,
+    providerType: resolvedProviderType,
     promptText: params.promptText,
     images: params.images,
     systemPrompt: params.systemPrompt,
@@ -580,7 +827,7 @@ export async function runMultiProviderAnalysis(params: {
     const isAbort = error instanceof Error && error.name === 'AbortError';
     if (isAbort) {
       throw new Error(
-        `${meta.name} request timed out after ${Math.round(timeoutMs / 1000)}s. Check your network or API key.`,
+        `${displayName} request timed out after ${Math.round(timeoutMs / 1000)}s. Check your network or API key.`,
       );
     }
     throw new Error(
@@ -629,5 +876,5 @@ export async function runMultiProviderAnalysis(params: {
   }
 
   const text = json && typeof json.text === 'string' ? json.text.trim() : '';
-  return text || `${meta.name} returned an empty response for this inspection.`;
+  return text || `${displayName} returned an empty response for this inspection.`;
 }

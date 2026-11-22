@@ -149,6 +149,21 @@ check(
   `HTTP ${invalidGeminiModel[0]}, error=${invalidGeminiModel[1]?.error}`,
 );
 
+const invalidModelsBase = await fetch(`${BASE}/api/providers/models`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    baseUrl: 'not-a-valid-url',
+    apiKey: '',
+    providerType: 'openai',
+  }),
+}).then(async (r) => [r.status, await r.json()]);
+check(
+  'POST /api/providers/models rejects invalid baseUrl',
+  invalidModelsBase[0] === 400 && typeof invalidModelsBase[1]?.error === 'string',
+  `HTTP ${invalidModelsBase[0]}`,
+);
+
 // 3e. Local Filesystem Project Persistence (/api/projects/save, /api/projects, /api/projects/:id, DELETE)
 const smokeProjId = `smoke-proj-${Date.now()}`;
 const saveProj = await fetch(`${BASE}/api/projects/save`, {

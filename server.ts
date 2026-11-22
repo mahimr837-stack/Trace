@@ -20,9 +20,12 @@ import {
   isValidGeminiModelName,
   LLM_PROVIDERS,
   normalizeProviderModel,
+  parseAvailableModelsResponse,
   readApiErrorMessage,
+  resolveModelsEndpointUrl,
   type LlmProviderId,
 } from './src/utils/llmProviders';
+import type { CustomProviderType } from './src/utils/globalSettings';
 import {
   GEOSPY_PREDICT_ENDPOINT,
   parseGeoSpyResponse,
@@ -73,6 +76,9 @@ interface InlineImageInput {
 interface ImageGenerateBody {
   provider?: LlmProviderId;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
+  model?: string;
   prompt?: string;
   images?: InlineImageInput[];
 }
@@ -80,10 +86,18 @@ interface ImageGenerateBody {
 interface LlmGenerateBody {
   provider?: LlmProviderId;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
   model?: string;
   promptText?: string;
   images?: InlineImageInput[];
   systemPrompt?: string;
+}
+
+interface ProviderModelsBody {
+  baseUrl?: string;
+  apiKey?: string;
+  providerType?: CustomProviderType;
 }
 
 interface GeoSpyProxyBody {
@@ -99,6 +113,31 @@ interface ShodanProxyBody {
 
 interface ArchiveProxyBody {
   url?: string;
+}
+
+function isValidHttpUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isLocalLoopbackUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host === '0.0.0.0'
+    );
+  } catch {
+    return false;
+  }
 }
 
 const PROVIDER_ENV_KEYS: Record<LlmProviderId, string> = {
@@ -661,12 +700,100 @@ async function callGoogleImagenRest(params: {
 async function executeProviderGeneration(params: {
   provider: LlmProviderId;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
   model: string;
   promptText: string;
   images: InlineImageInput[];
   systemPrompt?: string;
 }): Promise<string> {
-  const { provider, apiKey, model, promptText, images, systemPrompt } = params;
+  const {
+    provider,
+    apiKey,
+    baseUrl,
+    providerType,
+    model,
+    promptText,
+    images,
+    systemPrompt,
+  } = params;
+
+  const cleanBaseUrl = typeof baseUrl === 'string' ? baseUrl.trim().replace(/\/+$/, '') : '';
+  if (cleanBaseUrl) {
+    const resolvedType: CustomProviderType =
+      providerType === 'anthropic' ? 'anthropic' : 'openai';
+    const fallbackEnvVar =
+      resolvedType === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
+    const effectiveCustomKey =
+      resolveEffectiveApiKey(apiKey, fallbackEnvVar) || '';
+
+    if (!effectiveCustomKey && !isLocalLoopbackUrl(cleanBaseUrl)) {
+      throw new MissingApiKeyError('Custom Provider', fallbackEnvVar);
+    }
+
+    if (resolvedType === 'anthropic') {
+      const spec = buildAnthropicRequest({
+        apiKey: effectiveCustomKey,
+        model: model.trim() || getProviderMeta('anthropic').defaultModel,
+        promptText,
+        images,
+        systemPrompt,
+        baseUrl: cleanBaseUrl,
+      });
+      const upstreamRes = await fetchWithTimeout(
+        spec.url,
+        {
+          method: 'POST',
+          headers: spec.headers,
+          body: JSON.stringify(spec.body),
+        },
+        AI_REQUEST_TIMEOUT_MS,
+        'Anthropic Custom Provider',
+      );
+      const json = (await upstreamRes.json().catch(() => null)) as unknown;
+      if (!upstreamRes.ok) {
+        throw new Error(readApiErrorMessage(json, upstreamRes.status));
+      }
+      return (
+        extractAnthropicResponseText(json) ||
+        'Provider returned an empty response for this inspection.'
+      );
+    }
+
+    const appOrigin =
+      readServerEnvKey('APP_URL') || 'http://localhost:3000';
+    const spec = buildOpenAiCompatibleRequest({
+      provider: cleanBaseUrl.toLowerCase().includes('openrouter.ai')
+        ? 'openrouter'
+        : 'openai',
+      apiKey: effectiveCustomKey,
+      model: model.trim() || getProviderMeta('openai').defaultModel,
+      promptText,
+      images,
+      systemPrompt,
+      origin: appOrigin,
+      baseUrl: cleanBaseUrl,
+    });
+    const upstreamRes = await fetchWithTimeout(
+      spec.url,
+      {
+        method: 'POST',
+        headers: spec.headers,
+        body: JSON.stringify(spec.body),
+      },
+      AI_REQUEST_TIMEOUT_MS,
+      'Custom Provider',
+    );
+    const json = (await upstreamRes.json().catch(() => null)) as unknown;
+    if (!upstreamRes.ok) {
+      throw new Error(readApiErrorMessage(json, upstreamRes.status));
+    }
+    return (
+      extractOpenAiResponseText(json) ||
+      'Provider returned an empty response for this inspection.'
+    );
+  }
+
   const meta = getProviderMeta(provider);
   const envVarName = PROVIDER_ENV_KEYS[provider] ?? meta.envVarName;
   const resolvedModel = normalizeProviderModel(provider, model);
@@ -835,7 +962,110 @@ export async function startServer() {
     });
   });
 
-  // Unified server-side proxy route for all LLM providers (Gemini, Anthropic, OpenAI, OpenRouter, DeepSeek, Mistral)
+  // Fetches available models from any OpenAI-compatible or Anthropic provider endpoint (`${baseUrl}/models`)
+  app.post('/api/providers/models', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as ProviderModelsBody;
+    const rawBaseUrl =
+      typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
+    const providerType: CustomProviderType =
+      body.providerType === 'anthropic' ? 'anthropic' : 'openai';
+    const requestApiKey = extractRequestApiKey(req, body.apiKey);
+
+    if (!rawBaseUrl || !isValidHttpUrl(rawBaseUrl)) {
+      res.status(400).json({
+        error: 'A valid http:// or https:// baseUrl is required.',
+      });
+      return;
+    }
+
+    const modelsUrl = resolveModelsEndpointUrl(rawBaseUrl, providerType);
+    const keyPrefix = requestApiKey ? `${requestApiKey.slice(0, 4)}...` : 'NONE';
+    console.log(
+      `[api] POST /api/providers/models received (providerType=${providerType}, url=${modelsUrl}, keyPrefix=${keyPrefix})`,
+    );
+
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    if (providerType === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+      if (requestApiKey) {
+        headers['x-api-key'] = requestApiKey;
+      }
+    } else if (requestApiKey) {
+      headers.Authorization = `Bearer ${requestApiKey}`;
+    }
+
+    try {
+      let upstreamRes = await fetchWithTimeout(
+        modelsUrl,
+        {
+          method: 'GET',
+          headers,
+        },
+        20_000,
+        'Provider Models',
+      );
+
+      // Convenience fallback for local servers like Ollama when user enters `http://localhost:11434` without `/v1`
+      if (
+        upstreamRes.status === 404 &&
+        providerType === 'openai' &&
+        !/\/v1\/models$/i.test(modelsUrl)
+      ) {
+        const cleanBase = rawBaseUrl.replace(/\/+$/, '');
+        const fallbackUrl = `${cleanBase}/v1/models`;
+        const fallbackRes = await fetchWithTimeout(
+          fallbackUrl,
+          {
+            method: 'GET',
+            headers,
+          },
+          20_000,
+          'Provider Models',
+        );
+        if (fallbackRes.ok) {
+          upstreamRes = fallbackRes;
+        }
+      }
+
+      const rawText = await upstreamRes.text().catch(() => '');
+      let json: unknown = null;
+      if (rawText) {
+        try {
+          json = JSON.parse(rawText);
+        } catch {
+          json = null;
+        }
+      }
+
+      if (!upstreamRes.ok) {
+        const errMsg =
+          (json ? readApiErrorMessage(json, upstreamRes.status) : '') ||
+          `Failed to fetch models (HTTP ${upstreamRes.status}).`;
+        console.error(
+          `[api] POST /api/providers/models upstream error (${upstreamRes.status}): ${errMsg}`,
+        );
+        res.status(upstreamRes.status).json({ error: errMsg });
+        return;
+      }
+
+      const models = parseAvailableModelsResponse(json);
+      console.log(
+        `[api] POST /api/providers/models succeeded (count=${models.length}, url=${modelsUrl})`,
+      );
+      res.json({ models });
+    } catch (error) {
+      const isTimeout = error instanceof UpstreamTimeoutError;
+      const message = isTimeout
+        ? error.message
+        : `Failed to fetch models from ${modelsUrl} (${describeErrorCause(error)}).`;
+      console.error(`[api] POST /api/providers/models failed: ${message}`);
+      res.status(isTimeout ? 504 : 502).json({ error: message });
+    }
+  });
+
+  // Unified server-side proxy route for all LLM providers (custom OpenAI-compatible/Anthropic baseUrl + built-in providers)
   const handleLlmGenerate = async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as LlmGenerateBody;
     const promptText =
@@ -846,6 +1076,22 @@ export async function startServer() {
       return;
     }
 
+    const customBaseUrl =
+      typeof body.baseUrl === 'string'
+        ? body.baseUrl.trim().replace(/\/+$/, '')
+        : '';
+    if (customBaseUrl && !isValidHttpUrl(customBaseUrl)) {
+      res.status(400).json({
+        error: 'baseUrl must be a valid http:// or https:// URL.',
+      });
+      return;
+    }
+    const customProviderType: CustomProviderType | undefined = customBaseUrl
+      ? body.providerType === 'anthropic'
+        ? 'anthropic'
+        : 'openai'
+      : undefined;
+
     const providerId: LlmProviderId =
       body.provider &&
       LLM_PROVIDERS.some((p) => p.id === body.provider)
@@ -854,6 +1100,7 @@ export async function startServer() {
 
     const rawModel = typeof body.model === 'string' ? body.model.trim() : '';
     if (
+      !customBaseUrl &&
       rawModel &&
       (rawModel.toLowerCase().includes('gemini') || providerId === 'google') &&
       !isValidGeminiModelName(rawModel)
@@ -866,8 +1113,14 @@ export async function startServer() {
     }
 
     const meta = getProviderMeta(providerId);
-    const envVarName = PROVIDER_ENV_KEYS[providerId] ?? meta.envVarName;
-    const resolvedModel = normalizeProviderModel(providerId, body.model);
+    const envVarName = customBaseUrl
+      ? customProviderType === 'anthropic'
+        ? 'ANTHROPIC_API_KEY'
+        : 'OPENAI_API_KEY'
+      : PROVIDER_ENV_KEYS[providerId] ?? meta.envVarName;
+    const resolvedModel = customBaseUrl
+      ? rawModel || meta.defaultModel
+      : normalizeProviderModel(providerId, body.model);
     const systemPrompt =
       typeof body.systemPrompt === 'string' ? body.systemPrompt.trim() : '';
     const images = sanitizeInlineImages(body.images);
@@ -879,10 +1132,13 @@ export async function startServer() {
       : 'NONE';
 
     console.log(
-      `[api] POST ${req.path} received (provider=${providerId}, model=${resolvedModel}, keySource=${keySource}, keyPrefix=${keyPrefix}, images=${images.length}, promptChars=${promptText.length})`,
+      `[api] POST ${req.path} received (provider=${customBaseUrl ? `custom:${customProviderType}` : providerId}, model=${resolvedModel}, baseUrl=${customBaseUrl || 'default'}, keySource=${keySource}, keyPrefix=${keyPrefix}, images=${images.length}, promptChars=${promptText.length})`,
     );
 
-    if (keySource === 'none') {
+    if (
+      keySource === 'none' &&
+      !(customBaseUrl && isLocalLoopbackUrl(customBaseUrl))
+    ) {
       console.error(
         `[api] POST ${req.path} rejected (401 MISSING_API_KEY for provider=${providerId})`,
       );
@@ -897,19 +1153,21 @@ export async function startServer() {
       const text = await executeProviderGeneration({
         provider: providerId,
         apiKey: requestApiKey,
+        baseUrl: customBaseUrl || undefined,
+        providerType: customProviderType,
         model: resolvedModel,
         promptText,
         images,
         systemPrompt,
       });
       console.log(
-        `[api] POST ${req.path} succeeded (provider=${providerId}, model=${resolvedModel}, responseChars=${text.length})`,
+        `[api] POST ${req.path} succeeded (provider=${customBaseUrl ? `custom:${customProviderType}` : providerId}, model=${resolvedModel}, responseChars=${text.length})`,
       );
       res.json({ text });
     } catch (error) {
       const formatted = formatServerProviderError(
-        meta.name,
-        meta.envVarName,
+        customBaseUrl ? 'Custom Provider' : meta.name,
+        envVarName,
         error,
       );
       console.error(
@@ -1355,13 +1613,32 @@ export async function startServer() {
       return;
     }
 
+    const customBaseUrl =
+      typeof body.baseUrl === 'string'
+        ? body.baseUrl.trim().replace(/\/+$/, '')
+        : '';
+    if (customBaseUrl && !isValidHttpUrl(customBaseUrl)) {
+      res.status(400).json({
+        error: 'baseUrl must be a valid http:// or https:// URL.',
+      });
+      return;
+    }
+    const customProviderType: CustomProviderType | undefined = customBaseUrl
+      ? body.providerType === 'anthropic'
+        ? 'anthropic'
+        : 'openai'
+      : undefined;
+
     const providerId: LlmProviderId =
       body.provider && LLM_PROVIDERS.some((p) => p.id === body.provider)
         ? body.provider
         : 'google';
     const inlineImages = sanitizeInlineImages(body.images);
     const requestApiKey = extractRequestApiKey(req, body.apiKey);
-    const envVarName = providerId === 'openai' ? 'OPENAI_API_KEY' : 'GEMINI_API_KEY';
+    const envVarName =
+      customBaseUrl || providerId === 'openai'
+        ? 'OPENAI_API_KEY'
+        : 'GEMINI_API_KEY';
     const keySource = getKeySourceLabel(requestApiKey, envVarName);
     const effectiveKeyForLog = resolveEffectiveApiKey(requestApiKey, envVarName);
     const keyPrefix = effectiveKeyForLog
@@ -1369,12 +1646,21 @@ export async function startServer() {
       : 'NONE';
 
     console.log(
-      `[api] POST /api/image/generate received (provider=${providerId}, keySource=${keySource}, keyPrefix=${keyPrefix}, refImages=${inlineImages.length}, promptChars=${rawPrompt.length})`,
+      `[api] POST /api/image/generate received (provider=${customBaseUrl ? `custom:${customProviderType}` : providerId}, baseUrl=${customBaseUrl || 'default'}, keySource=${keySource}, keyPrefix=${keyPrefix}, refImages=${inlineImages.length}, promptChars=${rawPrompt.length})`,
     );
 
-    if (providerId === 'openai') {
-      const openAiKey = resolveEffectiveApiKey(requestApiKey, 'OPENAI_API_KEY');
-      if (!openAiKey) {
+    if (customBaseUrl && customProviderType === 'anthropic') {
+      res.status(400).json({
+        error:
+          'Anthropic providers do not expose a native image generation endpoint. Select an OpenAI-compatible image provider in Global Settings.',
+      });
+      return;
+    }
+
+    if (providerId === 'openai' || (customBaseUrl && customProviderType === 'openai')) {
+      const openAiKey =
+        resolveEffectiveApiKey(requestApiKey, 'OPENAI_API_KEY') || '';
+      if (!openAiKey && !(customBaseUrl && isLocalLoopbackUrl(customBaseUrl))) {
         console.error('[api] POST /api/image/generate rejected (401 MISSING_API_KEY for openai)');
         res.status(401).json({
           error: MISSING_API_KEY_MESSAGE,
@@ -1384,9 +1670,15 @@ export async function startServer() {
       }
 
       try {
+        const requestedModel =
+          typeof body.model === 'string' && body.model.trim()
+            ? body.model.trim()
+            : DALLE_MODEL_ID;
         const dalleSpec = buildOpenAiDalleRequest({
           apiKey: openAiKey,
           prompt: rawPrompt,
+          baseUrl: customBaseUrl || undefined,
+          model: customBaseUrl ? requestedModel : DALLE_MODEL_ID,
         });
         const upstreamRes = await fetchWithTimeout(
           dalleSpec.url,
@@ -1396,7 +1688,7 @@ export async function startServer() {
             body: JSON.stringify(dalleSpec.body),
           },
           AI_REQUEST_TIMEOUT_MS,
-          'OpenAI DALL-E 3',
+          customBaseUrl ? 'Custom Image Provider' : 'OpenAI DALL-E 3',
         );
         const json = (await upstreamRes.json().catch(() => null)) as unknown;
         if (!upstreamRes.ok) {
@@ -1405,23 +1697,25 @@ export async function startServer() {
 
         const imageUrl = extractOpenAiDalleImageUrl(json);
         if (!imageUrl) {
-          throw new Error('DALL-E 3 returned an empty image payload.');
+          throw new Error('Image generation API returned an empty image payload.');
         }
 
-        console.log('[api] POST /api/image/generate succeeded (provider=openai, model=dall-e-3)');
+        console.log(
+          `[api] POST /api/image/generate succeeded (provider=${customBaseUrl ? 'custom' : 'openai'}, model=${dalleSpec.body.model})`,
+        );
         res.json({
           imageUrl,
-          model: DALLE_MODEL_ID,
-          provider: 'openai',
+          model: dalleSpec.body.model,
+          provider: customBaseUrl ? 'custom' : 'openai',
         });
       } catch (error) {
         const formatted = formatServerProviderError(
-          'OpenAI DALL-E 3',
+          customBaseUrl ? 'Custom Image Provider' : 'OpenAI DALL-E 3',
           'OPENAI_API_KEY',
           error,
         );
         console.error(
-          `[api] POST /api/image/generate failed (provider=openai, status=${formatted.status}): ${formatted.message}`,
+          `[api] POST /api/image/generate failed (provider=${customBaseUrl ? 'custom' : 'openai'}, status=${formatted.status}): ${formatted.message}`,
         );
         res.status(formatted.status).json({
           error: formatted.message,

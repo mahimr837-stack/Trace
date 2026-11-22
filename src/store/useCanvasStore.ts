@@ -2092,7 +2092,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
     if (
       (hasImages || hasEnhanced || imagesWithData.length > 0) &&
-      !isVisionCapableModel(activeProvider, resolvedModel)
+      !isVisionCapableModel(
+        globalSettings.baseUrl ? 'openai' : activeProvider,
+        resolvedModel,
+      )
     ) {
       set((state) => ({
         alertMessage: NON_VISION_MODEL_WARNING,
@@ -2173,6 +2176,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         provider: activeProvider,
         model: resolvedModel,
         apiKey: activeApiKey || undefined,
+        baseUrl: globalSettings.baseUrl || undefined,
+        providerType: globalSettings.baseUrl
+          ? globalSettings.providerType
+          : undefined,
         promptText: structuredPrompt,
         images: inlineImageParts,
       });
@@ -2399,6 +2406,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         provider: globalSettings.provider,
         model: globalSettings.model,
         apiKey: activeApiKey || undefined,
+        baseUrl: globalSettings.baseUrl || undefined,
+        providerType: globalSettings.baseUrl
+          ? globalSettings.providerType
+          : undefined,
       });
 
       get().updateDorkNodeData(dorkNodeId, {
@@ -2453,7 +2464,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return { ok: false, error: msg };
     }
 
-    if (!isVisionCapableModel(activeProvider, globalSettings.model)) {
+    if (
+      !isVisionCapableModel(
+        globalSettings.baseUrl ? 'openai' : activeProvider,
+        globalSettings.model,
+      )
+    ) {
       set({ alertMessage: NON_VISION_MODEL_WARNING });
       return { ok: false, error: NON_VISION_MODEL_WARNING };
     }
@@ -2476,6 +2492,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         provider: activeProvider,
         model: globalSettings.model,
         apiKey: activeApiKey || undefined,
+        baseUrl: globalSettings.baseUrl || undefined,
+        providerType: globalSettings.baseUrl
+          ? globalSettings.providerType
+          : undefined,
         systemPrompt: GEOINTEL_SYSTEM_PROMPT,
         promptText: buildGeoIntelUserPrompt(connectedImage.title),
         images: [inlinePart],
@@ -2733,12 +2753,20 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const { imageUrl, modelUsed } = await requestTargetImageGeneration({
         provider: activeProvider,
         apiKey: activeApiKey || undefined,
+        baseUrl: globalSettings.baseUrl || undefined,
+        providerType: globalSettings.baseUrl
+          ? globalSettings.providerType
+          : undefined,
+        model: globalSettings.model || undefined,
         prompt: compiledPrompt,
         images: inlineImages,
       });
 
+      const activeCustom = globalSettings.customProviders.find(
+        (p) => p.id === globalSettings.activeCustomProviderId,
+      );
       const providerMeta = getProviderMeta(activeProvider);
-      const providerLabel = `${providerMeta.name} · ${modelUsed}`;
+      const providerLabel = `${activeCustom?.name || providerMeta.name} · ${modelUsed}`;
 
       get().updateSuspectNodeData(suspectNodeId, {
         suspectImageUrl: imageUrl,

@@ -301,3 +301,160 @@ test('auto-migrates invalid Gemini model names to gemini-1.5-flash, blocks non-v
 
   mockStorage.clear();
 });
+
+test('persists custom providers, parses /models responses, and routes Chat/Dork/Suspect calls through custom baseUrl', async () => {
+  const {
+    getActiveCustomProvider,
+    saveCustomProviders,
+  } = await import('./globalSettings');
+  const {
+    buildOpenAiCompatibleRequest,
+    fetchProviderModels,
+    parseAvailableModelsResponse,
+    resolveModelsEndpointUrl,
+  } = await import('./llmProviders');
+
+  const mockStorage = createMemoryStorage();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: mockStorage,
+    configurable: true,
+    writable: true,
+  });
+
+  assert.equal(
+    resolveModelsEndpointUrl('https://openrouter.ai/api/v1/', 'openai'),
+    'https://openrouter.ai/api/v1/models',
+  );
+  assert.equal(
+    resolveModelsEndpointUrl('https://api.anthropic.com', 'anthropic'),
+    'https://api.anthropic.com/v1/models',
+  );
+
+  const parsed = parseAvailableModelsResponse({
+    data: [
+      { id: 'openai/gpt-4o', name: 'OpenAI: GPT-4o' },
+      { id: 'anthropic/claude-3.5-sonnet', display_name: 'Claude 3.5 Sonnet' },
+    ],
+  });
+  assert.deepEqual(parsed, [
+    { id: 'anthropic/claude-3.5-sonnet', name: 'Claude 3.5 Sonnet' },
+    { id: 'openai/gpt-4o', name: 'OpenAI: GPT-4o' },
+  ]);
+
+  const fetched = await fetchProviderModels({
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKey: 'sk-or-custom-123',
+    providerType: 'openai',
+    fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+      assert.equal(String(url), '/api/providers/models');
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      assert.equal(body.baseUrl, 'https://openrouter.ai/api/v1');
+      assert.equal(body.apiKey, 'sk-or-custom-123');
+      assert.equal(body.providerType, 'openai');
+      return new Response(
+        JSON.stringify({
+          models: [{ id: 'openai/gpt-4o', name: 'OpenAI: GPT-4o' }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch,
+  });
+  assert.equal(fetched.length, 1);
+  assert.equal(fetched[0]?.id, 'openai/gpt-4o');
+
+  saveCustomProviders({
+    customProviders: [
+      {
+        id: 'custom-or-1',
+        name: 'OpenRouter',
+        baseUrl: 'https://openrouter.ai/api/v1/',
+        apiKey: 'sk-or-live-999',
+        providerType: 'openai',
+        model: 'openai/gpt-4o',
+      },
+    ],
+    activeCustomProviderId: 'custom-or-1',
+  });
+
+  const active = getActiveCustomProvider();
+  assert.ok(active);
+  assert.equal(active?.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(active?.apiKey, 'sk-or-live-999');
+  assert.equal(active?.model, 'openai/gpt-4o');
+
+  const customOpenAiSpec = buildOpenAiCompatibleRequest({
+    provider: 'openai',
+    apiKey: 'sk-or-live-999',
+    model: 'openai/gpt-4o',
+    promptText: 'Inspect frame',
+    images: [],
+    baseUrl: 'https://openrouter.ai/api/v1',
+  });
+  assert.equal(
+    customOpenAiSpec.url,
+    'https://openrouter.ai/api/v1/chat/completions',
+  );
+  assert.equal(customOpenAiSpec.headers.Authorization, 'Bearer sk-or-live-999');
+
+  let capturedLlmBody: Record<string, unknown> | null = null;
+  await runMultiProviderAnalysis({
+    promptText: 'Analyze target',
+    images: [],
+    fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedLlmBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+      return new Response(JSON.stringify({ text: 'Custom analysis OK' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch,
+  });
+  assert.equal(capturedLlmBody?.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(capturedLlmBody?.providerType, 'openai');
+  assert.equal(capturedLlmBody?.apiKey, 'sk-or-live-999');
+  assert.equal(capturedLlmBody?.model, 'openai/gpt-4o');
+
+  let capturedDorkBody: Record<string, unknown> | null = null;
+  const dorks = await generateGoogleDorks({
+    targetType: 'General OSINT',
+    extractedSourceText: 'target@domain.com',
+    fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedDorkBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+      return new Response(
+        JSON.stringify({ text: 'site:github.com "target@domain.com"' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch,
+  });
+  assert.equal(dorks.length, 1);
+  assert.equal(capturedDorkBody?.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(capturedDorkBody?.apiKey, 'sk-or-live-999');
+
+  let capturedSuspectBody: Record<string, unknown> | null = null;
+  await requestTargetImageGeneration({
+    prompt: 'Forensic sketch',
+    fetchImpl: (async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedSuspectBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+      return new Response(
+        JSON.stringify({
+          imageUrl: 'data:image/png;base64,CUSTOM',
+          model: 'openai/gpt-4o',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch,
+  });
+  assert.equal(capturedSuspectBody?.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(capturedSuspectBody?.providerType, 'openai');
+  assert.equal(capturedSuspectBody?.apiKey, 'sk-or-live-999');
+
+  mockStorage.clear();
+});

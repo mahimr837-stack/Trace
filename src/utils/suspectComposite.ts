@@ -2,10 +2,13 @@ import type { Edge } from 'reactflow';
 import type { OsintNode } from '../types/osint';
 import {
   ApiAuthError,
+  getActiveCustomProvider,
   getGlobalApiKey,
   MISSING_API_KEY_CODE,
   MISSING_API_KEY_MESSAGE,
+  normalizeBaseUrl,
   readGlobalSettings,
+  type CustomProviderType,
 } from './globalSettings';
 import type { LlmProviderId } from './llmProviders';
 import { HANDLE_IDS, type ParsedInlineImage } from './osintGraph';
@@ -188,7 +191,7 @@ export interface OpenAiDalleRequestSpec {
   url: string;
   headers: Record<string, string>;
   body: {
-    model: typeof DALLE_MODEL_ID;
+    model: string;
     prompt: string;
     n: 1;
     size: '1024x1024';
@@ -197,20 +200,35 @@ export interface OpenAiDalleRequestSpec {
 }
 
 /**
- * Builds an OpenAI DALL-E 3 image generation request payload for the server proxy.
+ * Builds an OpenAI-compatible Images API request payload for the server proxy.
  */
 export function buildOpenAiDalleRequest(params: {
   apiKey: string;
   prompt: string;
+  baseUrl?: string;
+  model?: string;
 }): OpenAiDalleRequestSpec {
+  const cleanBase = params.baseUrl?.trim()
+    ? normalizeBaseUrl(params.baseUrl)
+    : '';
+  const url = cleanBase
+    ? /\/images\/generations$/i.test(cleanBase)
+      ? cleanBase
+      : `${cleanBase.replace(/\/chat\/completions$/i, '')}/images/generations`
+    : OPENAI_IMAGES_ENDPOINT;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (params.apiKey.trim()) {
+    headers.Authorization = `Bearer ${params.apiKey.trim()}`;
+  }
+
   return {
-    url: OPENAI_IMAGES_ENDPOINT,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${params.apiKey.trim()}`,
-    },
+    url,
+    headers,
     body: {
-      model: DALLE_MODEL_ID,
+      model: params.model?.trim() || DALLE_MODEL_ID,
       prompt: params.prompt.trim(),
       n: 1,
       size: '1024x1024',
@@ -246,24 +264,45 @@ export interface ServerImageGenerationRequestSpec {
     prompt: string;
     images: ParsedInlineImage[];
     apiKey?: string;
+    baseUrl?: string;
+    providerType?: CustomProviderType;
+    model?: string;
   };
 }
 
 /**
  * Builds the client-to-server request spec for `/api/image/generate`.
- * Pulls the global API key from localStorage when available and forwards it
- * via both the `x-api-key` header and JSON body.
+ * Pulls `baseUrl`, `apiKey`, and `providerType` from the selected custom provider (or legacy global settings)
+ * and forwards the API key via both the `x-api-key` header and JSON body.
  */
 export function buildServerImageGenerationRequest(params: {
   provider?: LlmProviderId;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
+  model?: string;
   prompt: string;
   images?: ParsedInlineImage[];
 }): ServerImageGenerationRequestSpec {
   const globalSettings = readGlobalSettings();
+  const activeCustom = getActiveCustomProvider(globalSettings);
   const resolvedProvider = params.provider ?? globalSettings.provider;
+  const resolvedBaseUrl =
+    params.baseUrl !== undefined
+      ? normalizeBaseUrl(params.baseUrl)
+      : activeCustom?.baseUrl || globalSettings.baseUrl || '';
+  const resolvedProviderType: CustomProviderType | undefined =
+    params.providerType ??
+    (resolvedBaseUrl
+      ? activeCustom?.providerType || globalSettings.providerType || 'openai'
+      : undefined);
   const resolvedApiKey =
-    params.apiKey?.trim() || getGlobalApiKey(resolvedProvider);
+    params.apiKey?.trim() ||
+    (resolvedBaseUrl ? activeCustom?.apiKey?.trim() || '' : '') ||
+    getGlobalApiKey(resolvedProvider);
+  const resolvedModel =
+    params.model?.trim() ||
+    (resolvedBaseUrl ? activeCustom?.model?.trim() || '' : '');
 
   return {
     url: SERVER_IMAGE_GENERATE_ENDPOINT,
@@ -276,32 +315,53 @@ export function buildServerImageGenerationRequest(params: {
       prompt: params.prompt.trim(),
       images: params.images ?? [],
       ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
+      ...(resolvedBaseUrl ? { baseUrl: resolvedBaseUrl } : {}),
+      ...(resolvedBaseUrl && resolvedProviderType
+        ? { providerType: resolvedProviderType }
+        : {}),
+      ...(resolvedModel ? { model: resolvedModel } : {}),
     },
   };
 }
 
 /**
- * Calls the backend `/api/image/generate` proxy endpoint to generate a forensic composite image
- * using Google Imagen (`imagen-3.0-generate-001`) or OpenAI DALL-E 3 (`dall-e-3`).
- * Pulls the active provider and API key from global localStorage settings, or lets the server
- * fall back to `.env` / return HTTP 401 when neither is configured.
+ * Calls the backend `/api/image/generate` proxy endpoint to generate a forensic composite image.
+ * Pulls the active custom provider (`baseUrl`, `apiKey`, `providerType`) from global localStorage settings.
  */
 export async function requestTargetImageGeneration(params: {
   provider?: LlmProviderId;
   apiKey?: string;
+  baseUrl?: string;
+  providerType?: CustomProviderType;
+  model?: string;
   prompt: string;
   images?: ParsedInlineImage[];
   fetchImpl?: typeof fetch;
 }): Promise<{ imageUrl: string; modelUsed: string }> {
   const globalSettings = readGlobalSettings();
+  const activeCustom = getActiveCustomProvider(globalSettings);
   const resolvedProvider = params.provider ?? globalSettings.provider;
+  const resolvedBaseUrl =
+    params.baseUrl !== undefined
+      ? normalizeBaseUrl(params.baseUrl)
+      : activeCustom?.baseUrl || globalSettings.baseUrl || '';
+  const resolvedProviderType: CustomProviderType | undefined =
+    params.providerType ??
+    (resolvedBaseUrl
+      ? activeCustom?.providerType || globalSettings.providerType || 'openai'
+      : undefined);
   const resolvedApiKey =
-    params.apiKey?.trim() || getGlobalApiKey(resolvedProvider);
+    params.apiKey?.trim() ||
+    (resolvedBaseUrl ? activeCustom?.apiKey?.trim() || '' : '') ||
+    getGlobalApiKey(resolvedProvider);
 
   const fetchFn = params.fetchImpl ?? fetch;
   const spec = buildServerImageGenerationRequest({
     provider: resolvedProvider,
     apiKey: resolvedApiKey || undefined,
+    baseUrl: resolvedBaseUrl || undefined,
+    providerType: resolvedProviderType,
+    model: params.model,
     prompt: params.prompt,
     images: params.images,
   });
